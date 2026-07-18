@@ -8,8 +8,8 @@ Private, local-only Chrome/Edge extension. No network, no analytics, no remote c
 
 | Mode | What it does | Interactive? | Best for |
 |---|---|---|---|
-| **Watch** | Screenshots + crops the box into a full-bleed proxy window | No (read-only) | Monitoring meters, dashboards |
-| **Focus** | Re-frames the **real tab** to that box in a tight popup | **Yes** | Clicking/typing in a widget while it stays “live” |
+| **Watch** | True-size pixel crop → full-bleed proxy | No (read-only) | Monitoring meters, dashboards |
+| **Focus** | Same true-size stream **+** clicks/keys relayed into the live source tab | **Yes** | Interacting while the real tab stays fully running |
 
 ## Install (unpacked)
 
@@ -38,13 +38,16 @@ Private, local-only Chrome/Edge extension. No network, no analytics, no remote c
 
 ## How Focus works
 
-1. Measure your CSS-pixel box  
-2. Inject a transform/clip so that box sits at `(0,0)` with overflow hidden  
-3. Move the tab into a `popup` window and resize to the box  
-4. The page keeps running as a normal tab (JS, websockets, React)  
-5. Exit restores styles and moves the tab back  
+CSS re-frame of SPAs (Grok, etc.) went black — they reflow when the window shrinks.
 
-**Limits:** Chrome still shows a small OS title bar on popup windows. Some sites with heavy `position: fixed` shells can look off. Minimized windows may still be throttled by Chrome — better than screenshots, not magic.
+Focus instead uses the **same true-size Watch pipeline**, then:
+
+1. Source tab stays full-size in Chrome (always live)  
+2. Proxy shows the exact pixel box (1:1, full-bleed)  
+3. Clicks / wheel / keys in the proxy are **relayed** into the source tab at mapped coordinates  
+4. **✕ Exit Focus** closes the proxy and **focuses the source tab in Chrome**  
+
+**Limits:** Source tab should stay open (and ideally still the active tab in its window) for fresh captures. Synthetic events don’t cover every site interaction (canvas games, etc.).
 
 ## How Watch works
 

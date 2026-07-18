@@ -320,8 +320,10 @@
             frozen.width +
             "×" +
             frozen.height +
-            " px · live tab · Exit Focus button top-right"
+            " px · live mirror · click in proxy · Exit returns to tab"
         );
+        // Same sample loop as Watch (true-size pixels); input is relayed separately
+        startSampleLoop(frozen, viewport);
       } catch (err) {
         destroyUi();
         toast(String(err && err.message ? err.message : err));
