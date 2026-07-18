@@ -636,8 +636,8 @@ async function applyAttractFill(tabId, boxW, boxH, realW, realH) {
     world: "MAIN",
     func: (rw, rh) => {
       if (window.__viewProxyAttractor && window.__viewProxyAttractor.setFill) {
-        // contain = uniform scale + center content in the window
-        return window.__viewProxyAttractor.setFill(rw, rh, "contain");
+        // Width-flush + vertical center (see attractor-main setFill)
+        return window.__viewProxyAttractor.setFill(rw, rh);
       }
       return { ok: false };
     },

@@ -1,8 +1,11 @@
 /**
  * ViewProxy Attractor — MAIN world
  *
- * Freeze SPA metrics, translate crop to origin, scale+center into the window,
- * crop-resize edges, Exit → extension restores a normal Chrome tab.
+ * Layout rules (user spec):
+ *  - Content NEVER leaves left/right of the viewport (always width-flush)
+ *  - Content stays vertically centered
+ *  - Left/right window edges → scale (zoom) toward center; crop L/W unchanged
+ *  - Top/bottom window edges → crop (consume/reveal content); T/H change
  */
 (function () {
   const STYLE_ID = "__viewproxy_attr_style";
@@ -11,7 +14,7 @@
   const FLAG = "__viewproxy_attr";
 
   const api = {
-    version: 4,
+    version: 5,
     state: null,
 
     apply(box, viewport) {
@@ -36,7 +39,6 @@
         centerX: 0,
         centerY: 0,
         cropResize: true,
-        fillMode: "contain", // uniform scale + center (fluid fill without stretch)
         scrollX: window.scrollX,
         scrollY: window.scrollY,
         patches: [],
@@ -126,12 +128,12 @@
       }
 
       /**
-       * Order (rightmost first): translate crop to origin → scale → center in client
-       * transform: translate(cx,cy) scale(sx,sy) translate(-L,-T)
+       * Rightmost first: translate crop→origin, scale (width-driven), then vertical center.
+       * Horizontal: always flush L/R (cx = 0 when sx = realW/W).
        */
       function applyStageTransform(sx, sy, cx, cy) {
         const s = api.state || state;
-        cx = cx != null ? cx : s.centerX || 0;
+        cx = cx != null ? cx : 0;
         cy = cy != null ? cy : s.centerY || 0;
         stage.style.cssText = [
           "display:block",
@@ -183,25 +185,20 @@
           position: fixed !important;
           left: 50% !important;
           bottom: 10px !important;
-          top: auto !important;
-          right: auto !important;
           transform: translateX(-50%) !important;
           z-index: 2147483647 !important;
           display: flex !important;
           flex-direction: column !important;
-          align-items: stretch !important;
           gap: 6px !important;
-          min-width: 200px !important;
+          min-width: 220px !important;
           max-width: calc(100% - 16px) !important;
-          border: 1px solid rgba(250,204,21,0.45) !important;
+          border: 1px solid rgba(250,204,21,0.5) !important;
           border-radius: 12px !important;
-          background: rgba(15,23,42,0.94) !important;
+          background: rgba(15,23,42,0.95) !important;
           color: #f8fafc !important;
-          font: 700 12px/1.2 system-ui,sans-serif !important;
           padding: 10px 12px !important;
           box-shadow: 0 8px 28px rgba(0,0,0,0.45) !important;
           pointer-events: auto !important;
-          opacity: 1 !important;
         }
         #${EXIT_ID} button[data-act="exit"] {
           all: unset !important;
@@ -223,7 +220,7 @@
           display: flex !important;
           gap: 10px !important;
           align-items: center !important;
-          justify-content: space-between !important;
+          justify-content: center !important;
           font: 600 11px/1.2 system-ui,sans-serif !important;
           color: #e2e8f0 !important;
         }
@@ -245,29 +242,25 @@
         window.scrollTo(0, 0);
       } catch (_) {}
 
-      // Always rebuild exit chrome so the return button is obvious
       document.getElementById(EXIT_ID)?.remove();
       const exit = document.createElement("div");
       exit.id = EXIT_ID;
       exit.innerHTML =
         '<button type="button" data-act="exit">↩ Return to Chrome tab</button>' +
         '<div class="vp-row">' +
-        '<label><input type="checkbox" data-act="crop" checked /> Crop edges</label>' +
-        '<label><input type="checkbox" data-act="center" checked /> Center content</label>' +
+        '<label><input type="checkbox" data-act="crop" checked /> Crop edges (top/bottom)</label>' +
         "</div>";
 
       exit.addEventListener(
         "click",
         (e) => {
           const t = e.target;
-          if (!t) return;
           const act =
-            (t.getAttribute && t.getAttribute("data-act")) ||
-            (t.closest && t.closest("[data-act]") && t.closest("[data-act]").getAttribute("data-act"));
+            (t && t.getAttribute && t.getAttribute("data-act")) ||
+            (t && t.closest && t.closest("[data-act]") && t.closest("[data-act]").getAttribute("data-act"));
           if (act === "exit") {
             e.preventDefault();
             e.stopPropagation();
-            // Dual signal so restore is hard to miss
             window.postMessage({ source: "viewproxy", type: "exit-focus" }, "*");
             try {
               document.documentElement.setAttribute("data-viewproxy-exit", String(Date.now()));
@@ -280,28 +273,12 @@
         "change",
         (e) => {
           const t = e.target;
-          if (!t || !t.getAttribute) return;
-          const act = t.getAttribute("data-act");
-          if (act === "crop") {
+          if (t && t.getAttribute && t.getAttribute("data-act") === "crop") {
             if (api.state) api.state.cropResize = !!t.checked;
             window.postMessage(
               { source: "viewproxy", type: "crop-resize-toggle", enabled: !!t.checked },
               "*"
             );
-          }
-          if (act === "center") {
-            if (api.state) {
-              api.state.fillMode = t.checked ? "contain" : "fill";
-              // Re-apply last fill if we have scales
-              api.state.applyStageTransform(
-                api.state.fillScaleX || 1,
-                api.state.fillScaleY || 1,
-                t.checked ? api.state.centerX : 0,
-                t.checked ? api.state.centerY : 0
-              );
-              // Ask extension to re-measure and fill (isolated real size)
-              window.postMessage({ source: "viewproxy", type: "request-refill" }, "*");
-            }
           }
         },
         true
@@ -319,12 +296,12 @@
     },
 
     /**
-     * Fill the real client with the crop region.
-     * contain (default): uniform scale + center in window
-     * fill: stretch to edges
-     * cover: uniform scale covering window (may clip)
+     * Width-flush + vertical center:
+     *   sx = sy = realW / W   (always touch left & right)
+     *   cx = 0
+     *   cy = (realH - H*sy) / 2
      */
-    setFill(realW, realH, mode) {
+    setFill(realW, realH) {
       const state = api.state;
       if (!state || !state.applyStageTransform) return { ok: false };
 
@@ -332,79 +309,78 @@
       realH = Math.max(1, Number(realH) || 1);
       const W = Math.max(1, state.W);
       const H = Math.max(1, state.H);
-      mode = mode || state.fillMode || "contain";
 
-      let sx = realW / W;
-      let sy = realH / H;
-      let cx = 0;
-      let cy = 0;
-
-      if (mode === "contain" || mode === "center") {
-        const s = Math.min(sx, sy);
-        sx = s;
-        sy = s;
-        // Center the scaled box in the real client
-        cx = (realW - W * sx) / 2;
-        cy = (realH - H * sy) / 2;
-      } else if (mode === "cover") {
-        const s = Math.max(sx, sy);
-        sx = s;
-        sy = s;
-        cx = (realW - W * sx) / 2;
-        cy = (realH - H * sy) / 2;
-      }
-      // fill: sx/sy independent, no center offset
+      // Never leave left/right: scale uniformly by WIDTH
+      const s = realW / W;
+      const sx = s;
+      const sy = s;
+      const cx = 0;
+      // Fluid vertical center
+      const cy = (realH - H * sy) / 2;
 
       state.fillScaleX = sx;
       state.fillScaleY = sy;
       state.centerX = cx;
       state.centerY = cy;
-      state.fillMode = mode === "center" ? "contain" : mode;
       state.applyStageTransform(sx, sy, cx, cy);
-      return { ok: true, sx, sy, cx, cy, realW, realH, W, H, L: state.L, T: state.T, mode: state.fillMode };
+      return { ok: true, sx, sy, cx, cy, realW, realH, W, H, L: state.L, T: state.T };
     },
 
+    /**
+     * Window bounds deltas (chrome.windows DIP).
+     *
+     * Left/right: do NOT change L/W — only window size changes → setFill scales toward center.
+     * Top/bottom: crop T/H (top edge consumes top content, bottom consumes bottom).
+     */
     applyBoundsDelta(dLeft, dTop, dWidth, dHeight) {
       const state = api.state;
       if (!state) return { ok: false };
 
+      // Horizontal resize → scale only (caller will setFill). Keep crop L/W fixed
+      // unless cropResize is off entirely.
+      const horizontalOnly =
+        dTop === 0 && dHeight === 0 && (dLeft !== 0 || dWidth !== 0);
+
       if (!state.cropResize) {
-        return { ok: true, cropResize: false, box: api.getBox() };
+        return { ok: true, cropResize: false, box: api.getBox(), scaleOnly: true };
       }
 
-      let L = state.L + dLeft;
+      if (horizontalOnly) {
+        // L/R edges: scale toward center via setFill only
+        return { ok: true, cropResize: true, box: api.getBox(), scaleOnly: true };
+      }
+
+      // Vertical (and diagonal): apply top/bottom crop. Ignore horizontal crop of L/W
+      // so left/right never "eat" horizontal content — only scale.
       let T = state.T + dTop;
-      let W = state.W + dWidth;
       let H = state.H + dHeight;
 
+      // If diagonal, still only vertical crop; width stays
       const MIN = 40;
-      if (W < MIN) {
-        if (dLeft > 0) L -= MIN - W;
-        W = MIN;
-      }
       if (H < MIN) {
         if (dTop > 0) T -= MIN - H;
         H = MIN;
       }
-
-      L = Math.max(0, Math.min(L, state.layoutW - MIN));
       T = Math.max(0, Math.min(T, state.layoutH - MIN));
-      W = Math.max(MIN, Math.min(W, state.layoutW - L));
       H = Math.max(MIN, Math.min(H, state.layoutH - T));
 
-      state.L = Math.round(L);
       state.T = Math.round(T);
-      state.W = Math.round(W);
       state.H = Math.round(H);
+      // L, W unchanged — horizontal flush preserved
 
       state.applyStageTransform(
         state.fillScaleX || 1,
         state.fillScaleY || 1,
-        state.centerX || 0,
+        0,
         state.centerY || 0
       );
 
-      return { ok: true, cropResize: true, box: api.getBox() };
+      return {
+        ok: true,
+        cropResize: true,
+        box: api.getBox(),
+        scaleOnly: false
+      };
     },
 
     setCropResize(enabled) {
