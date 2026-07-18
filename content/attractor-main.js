@@ -1,21 +1,17 @@
 /**
  * ViewProxy Attractor — MAIN world
  *
- * - Freeze SPA viewport metrics (React sees original layout size)
- * - Translate selected box to (0,0)
- * - Scale box to fill real client area
- * - Crop-resize: window edge drags update L/T/W/H so TOP behaves like BOTTOM
- *   (edges "consume" content instead of pushing it)
+ * Freeze SPA metrics, translate crop to origin, scale+center into the window,
+ * crop-resize edges, Exit → extension restores a normal Chrome tab.
  */
 (function () {
-  // Always reinstall API (versioned) so extension reloads apply
   const STYLE_ID = "__viewproxy_attr_style";
   const STAGE_ID = "__viewproxy_attr_stage";
   const EXIT_ID = "__viewproxy_attr_exit";
   const FLAG = "__viewproxy_attr";
 
   const api = {
-    version: 3,
+    version: 4,
     state: null,
 
     apply(box, viewport) {
@@ -37,7 +33,10 @@
         layoutH,
         fillScaleX: 1,
         fillScaleY: 1,
-        cropResize: true, // default: edges act as crop tools
+        centerX: 0,
+        centerY: 0,
+        cropResize: true,
+        fillMode: "contain", // uniform scale + center (fluid fill without stretch)
         scrollX: window.scrollX,
         scrollY: window.scrollY,
         patches: [],
@@ -82,7 +81,6 @@
         }
       } catch (_) {}
 
-      // Swallow resize so SPA doesn't reflow — crop-resize is handled by the extension
       state.resizeStop = function (e) {
         e.stopImmediatePropagation();
         e.preventDefault();
@@ -127,14 +125,31 @@
         state.stageCreated = true;
       }
 
-      function applyStageTransform(sx, sy) {
+      /**
+       * Order (rightmost first): translate crop to origin → scale → center in client
+       * transform: translate(cx,cy) scale(sx,sy) translate(-L,-T)
+       */
+      function applyStageTransform(sx, sy, cx, cy) {
         const s = api.state || state;
-        // CSS: rightmost applied first → translate to origin, then scale to fill client
+        cx = cx != null ? cx : s.centerX || 0;
+        cy = cy != null ? cy : s.centerY || 0;
         stage.style.cssText = [
           "display:block",
           "position:relative",
           "box-sizing:border-box",
-          "transform:scale(" + sx + "," + sy + ") translate(" + -s.L + "px," + -s.T + "px)",
+          "transform:translate(" +
+            cx +
+            "px," +
+            cy +
+            "px) scale(" +
+            sx +
+            "," +
+            sy +
+            ") translate(" +
+            -s.L +
+            "px," +
+            -s.T +
+            "px)",
           "transform-origin:0 0",
           "width:" + s.layoutW + "px",
           "min-width:" + s.layoutW + "px",
@@ -144,7 +159,7 @@
         ].join(";");
       }
       state.applyStageTransform = applyStageTransform;
-      applyStageTransform(1, 1);
+      applyStageTransform(1, 1, 0, 0);
 
       let style = document.getElementById(STYLE_ID);
       if (!style) {
@@ -166,30 +181,58 @@
         }
         #${EXIT_ID} {
           position: fixed !important;
-          top: 6px !important;
-          right: 6px !important;
+          left: 50% !important;
+          bottom: 10px !important;
+          top: auto !important;
+          right: auto !important;
+          transform: translateX(-50%) !important;
           z-index: 2147483647 !important;
-          border: 1px solid rgba(255,255,255,.2) !important;
-          border-radius: 8px !important;
-          background: rgba(15,23,42,.92) !important;
+          display: flex !important;
+          flex-direction: column !important;
+          align-items: stretch !important;
+          gap: 6px !important;
+          min-width: 200px !important;
+          max-width: calc(100% - 16px) !important;
+          border: 1px solid rgba(250,204,21,0.45) !important;
+          border-radius: 12px !important;
+          background: rgba(15,23,42,0.94) !important;
           color: #f8fafc !important;
-          font: 700 11px/1 system-ui,sans-serif !important;
-          padding: 7px 10px !important;
-          cursor: pointer !important;
-          opacity: 0.35 !important;
-          transition: opacity .15s ease !important;
+          font: 700 12px/1.2 system-ui,sans-serif !important;
+          padding: 10px 12px !important;
+          box-shadow: 0 8px 28px rgba(0,0,0,0.45) !important;
           pointer-events: auto !important;
-        }
-        #${EXIT_ID}:hover {
           opacity: 1 !important;
-          background: rgba(127,29,29,.95) !important;
         }
-        #${EXIT_ID} .vp-toggle {
-          display: block;
-          margin-top: 6px;
-          font: 600 10px/1.2 system-ui,sans-serif;
-          opacity: 0.9;
-          white-space: nowrap;
+        #${EXIT_ID} button[data-act="exit"] {
+          all: unset !important;
+          box-sizing: border-box !important;
+          display: block !important;
+          width: 100% !important;
+          text-align: center !important;
+          cursor: pointer !important;
+          background: #facc15 !important;
+          color: #0f172a !important;
+          font: 800 13px/1.2 system-ui,sans-serif !important;
+          padding: 10px 12px !important;
+          border-radius: 8px !important;
+        }
+        #${EXIT_ID} button[data-act="exit"]:hover {
+          filter: brightness(1.06) !important;
+        }
+        #${EXIT_ID} .vp-row {
+          display: flex !important;
+          gap: 10px !important;
+          align-items: center !important;
+          justify-content: space-between !important;
+          font: 600 11px/1.2 system-ui,sans-serif !important;
+          color: #e2e8f0 !important;
+        }
+        #${EXIT_ID} label {
+          display: flex !important;
+          gap: 6px !important;
+          align-items: center !important;
+          cursor: pointer !important;
+          user-select: none !important;
         }
       `;
 
@@ -202,41 +245,68 @@
         window.scrollTo(0, 0);
       } catch (_) {}
 
-      let exit = document.getElementById(EXIT_ID);
-      if (!exit) {
-        exit = document.createElement("div");
-        exit.id = EXIT_ID;
-        exit.innerHTML =
-          '<button type="button" data-act="exit" style="all:unset;cursor:pointer;display:block;width:100%">✕ Exit Focus</button>' +
-          '<label class="vp-toggle"><input type="checkbox" data-act="crop" checked /> Crop edges</label>';
-        exit.addEventListener(
-          "click",
-          (e) => {
-            const act = e.target && e.target.getAttribute && e.target.getAttribute("data-act");
-            if (act === "exit" || e.target.closest?.('[data-act="exit"]')) {
-              e.preventDefault();
-              e.stopPropagation();
-              window.postMessage({ source: "viewproxy", type: "exit-focus" }, "*");
-            }
-          },
-          true
-        );
-        exit.addEventListener(
-          "change",
-          (e) => {
-            const t = e.target;
-            if (t && t.getAttribute && t.getAttribute("data-act") === "crop") {
-              if (api.state) api.state.cropResize = !!t.checked;
-              window.postMessage(
-                { source: "viewproxy", type: "crop-resize-toggle", enabled: !!t.checked },
-                "*"
+      // Always rebuild exit chrome so the return button is obvious
+      document.getElementById(EXIT_ID)?.remove();
+      const exit = document.createElement("div");
+      exit.id = EXIT_ID;
+      exit.innerHTML =
+        '<button type="button" data-act="exit">↩ Return to Chrome tab</button>' +
+        '<div class="vp-row">' +
+        '<label><input type="checkbox" data-act="crop" checked /> Crop edges</label>' +
+        '<label><input type="checkbox" data-act="center" checked /> Center content</label>' +
+        "</div>";
+
+      exit.addEventListener(
+        "click",
+        (e) => {
+          const t = e.target;
+          if (!t) return;
+          const act =
+            (t.getAttribute && t.getAttribute("data-act")) ||
+            (t.closest && t.closest("[data-act]") && t.closest("[data-act]").getAttribute("data-act"));
+          if (act === "exit") {
+            e.preventDefault();
+            e.stopPropagation();
+            // Dual signal so restore is hard to miss
+            window.postMessage({ source: "viewproxy", type: "exit-focus" }, "*");
+            try {
+              document.documentElement.setAttribute("data-viewproxy-exit", String(Date.now()));
+            } catch (_) {}
+          }
+        },
+        true
+      );
+      exit.addEventListener(
+        "change",
+        (e) => {
+          const t = e.target;
+          if (!t || !t.getAttribute) return;
+          const act = t.getAttribute("data-act");
+          if (act === "crop") {
+            if (api.state) api.state.cropResize = !!t.checked;
+            window.postMessage(
+              { source: "viewproxy", type: "crop-resize-toggle", enabled: !!t.checked },
+              "*"
+            );
+          }
+          if (act === "center") {
+            if (api.state) {
+              api.state.fillMode = t.checked ? "contain" : "fill";
+              // Re-apply last fill if we have scales
+              api.state.applyStageTransform(
+                api.state.fillScaleX || 1,
+                api.state.fillScaleY || 1,
+                t.checked ? api.state.centerX : 0,
+                t.checked ? api.state.centerY : 0
               );
+              // Ask extension to re-measure and fill (isolated real size)
+              window.postMessage({ source: "viewproxy", type: "request-refill" }, "*");
             }
-          },
-          true
-        );
-        document.documentElement.appendChild(exit);
-      }
+          }
+        },
+        true
+      );
+      document.documentElement.appendChild(exit);
 
       api.state = state;
       return {
@@ -248,6 +318,12 @@
       };
     },
 
+    /**
+     * Fill the real client with the crop region.
+     * contain (default): uniform scale + center in window
+     * fill: stretch to edges
+     * cover: uniform scale covering window (may clip)
+     */
     setFill(realW, realH, mode) {
       const state = api.state;
       if (!state || !state.applyStageTransform) return { ok: false };
@@ -256,57 +332,53 @@
       realH = Math.max(1, Number(realH) || 1);
       const W = Math.max(1, state.W);
       const H = Math.max(1, state.H);
-      mode = mode || "fill";
+      mode = mode || state.fillMode || "contain";
 
       let sx = realW / W;
       let sy = realH / H;
-      if (mode === "contain") {
+      let cx = 0;
+      let cy = 0;
+
+      if (mode === "contain" || mode === "center") {
         const s = Math.min(sx, sy);
         sx = s;
         sy = s;
+        // Center the scaled box in the real client
+        cx = (realW - W * sx) / 2;
+        cy = (realH - H * sy) / 2;
       } else if (mode === "cover") {
         const s = Math.max(sx, sy);
         sx = s;
         sy = s;
+        cx = (realW - W * sx) / 2;
+        cy = (realH - H * sy) / 2;
       }
+      // fill: sx/sy independent, no center offset
 
       state.fillScaleX = sx;
       state.fillScaleY = sy;
-      state.applyStageTransform(sx, sy);
-      return { ok: true, sx, sy, realW, realH, W, H, L: state.L, T: state.T };
+      state.centerX = cx;
+      state.centerY = cy;
+      state.fillMode = mode === "center" ? "contain" : mode;
+      state.applyStageTransform(sx, sy, cx, cy);
+      return { ok: true, sx, sy, cx, cy, realW, realH, W, H, L: state.L, T: state.T, mode: state.fillMode };
     },
 
-    /**
-     * Crop-resize from window bounds deltas (CSS/DIP pixels from chrome.windows).
-     *
-     * Windows default: top-left of client is content origin.
-     * Dragging TOP down moves the window and keeps content top-anchored → "pushes" content.
-     * We instead treat every edge as a crop edge:
-     *   dLeft/dTop shift the content origin (L/T)
-     *   dWidth/dHeight change visible size (W/H)
-     *
-     * So top-down ≡ consume top (like bottom-up consumes bottom).
-     */
     applyBoundsDelta(dLeft, dTop, dWidth, dHeight) {
       const state = api.state;
       if (!state) return { ok: false };
 
       if (!state.cropResize) {
-        // Normal Windows behavior: only size changes; origin stays (top-left anchor)
-        // W/H track client via setFill only
         return { ok: true, cropResize: false, box: api.getBox() };
       }
 
-      // Expand/shrink visible region in layout coordinates (1 DIP ≈ 1 CSS px)
       let L = state.L + dLeft;
       let T = state.T + dTop;
       let W = state.W + dWidth;
       let H = state.H + dHeight;
 
-      // Minimum crop size
       const MIN = 40;
       if (W < MIN) {
-        // If shrinking from left, push L back
         if (dLeft > 0) L -= MIN - W;
         W = MIN;
       }
@@ -315,7 +387,6 @@
         H = MIN;
       }
 
-      // Clamp to layout
       L = Math.max(0, Math.min(L, state.layoutW - MIN));
       T = Math.max(0, Math.min(T, state.layoutH - MIN));
       W = Math.max(MIN, Math.min(W, state.layoutW - L));
@@ -326,14 +397,14 @@
       state.W = Math.round(W);
       state.H = Math.round(H);
 
-      // Re-apply transform with current fill scale
-      state.applyStageTransform(state.fillScaleX || 1, state.fillScaleY || 1);
+      state.applyStageTransform(
+        state.fillScaleX || 1,
+        state.fillScaleY || 1,
+        state.centerX || 0,
+        state.centerY || 0
+      );
 
-      return {
-        ok: true,
-        cropResize: true,
-        box: api.getBox()
-      };
+      return { ok: true, cropResize: true, box: api.getBox() };
     },
 
     setCropResize(enabled) {
@@ -346,19 +417,6 @@
       const s = api.state;
       if (!s) return null;
       return { left: s.L, top: s.T, width: s.W, height: s.H };
-    },
-
-    getState() {
-      const s = api.state;
-      if (!s) return null;
-      return {
-        box: api.getBox(),
-        layoutW: s.layoutW,
-        layoutH: s.layoutH,
-        cropResize: s.cropResize,
-        fillScaleX: s.fillScaleX,
-        fillScaleY: s.fillScaleY
-      };
     },
 
     restore(opts) {

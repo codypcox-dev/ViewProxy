@@ -199,21 +199,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (focusSession) {
       focusSession.cropResize = message.enabled !== false;
       chrome.storage.session.set({ viewproxyFocusSession: focusSession }).catch(() => {});
+      chrome.scripting
+        .executeScript({
+          target: { tabId: focusSession.tabId },
+          world: "MAIN",
+          func: (en) => {
+            if (window.__viewProxyAttractor?.setCropResize) {
+              return window.__viewProxyAttractor.setCropResize(en);
+            }
+            return { ok: false };
+          },
+          args: [message.enabled !== false]
+        })
+        .catch(() => {});
     }
-    chrome.scripting
-      .executeScript({
-        target: { tabId: focusSession?.tabId },
-        world: "MAIN",
-        func: (en) => {
-          if (window.__viewProxyAttractor?.setCropResize) {
-            return window.__viewProxyAttractor.setCropResize(en);
-          }
-          return { ok: false };
-        },
-        args: [message.enabled !== false]
-      })
-      .catch(() => {});
     sendResponse({ ok: true, cropResize: focusSession?.cropResize !== false });
+    return false;
+  }
+
+  if (type === "attract-refill") {
+    if (focusSession?.tabId) {
+      applyAttractFill(
+        focusSession.tabId,
+        focusSession.box.width,
+        focusSession.box.height
+      )
+        .then(() => sendResponse({ ok: true }))
+        .catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
+      return true;
+    }
+    sendResponse({ ok: false });
     return false;
   }
 
@@ -621,8 +636,8 @@ async function applyAttractFill(tabId, boxW, boxH, realW, realH) {
     world: "MAIN",
     func: (rw, rh) => {
       if (window.__viewProxyAttractor && window.__viewProxyAttractor.setFill) {
-        // fill = stretch box to exact client (fluid cover of the window)
-        return window.__viewProxyAttractor.setFill(rw, rh, "fill");
+        // contain = uniform scale + center content in the window
+        return window.__viewProxyAttractor.setFill(rw, rh, "contain");
       }
       return { ok: false };
     },
@@ -631,7 +646,7 @@ async function applyAttractFill(tabId, boxW, boxH, realW, realH) {
 }
 
 /**
- * Exit Focus/Attract: restore page world, put tab back in normal Chrome.
+ * Exit Focus/Attract: restore page, force tab into a normal Chrome window.
  */
 async function stopFocusMode() {
   let session = focusSession;
@@ -651,7 +666,7 @@ async function stopFocusMode() {
   const { tabId, originalWindowId, originalIndex, originalHadOtherTabs, focusWindowId } =
     session;
 
-  // 1) Unfreeze + unwrap in MAIN world
+  // 1) Unfreeze + unwrap in MAIN world (must happen while tab still exists)
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
@@ -669,8 +684,10 @@ async function stopFocusMode() {
     });
   } catch (_) {}
 
-  // 2) Return tab to a normal Chrome window
-  let moved = false;
+  // 2) Always put the tab in a normal Chrome window (never leave it as a popup)
+  let restored = false;
+
+  // Prefer original multi-tab window
   if (originalHadOtherTabs && originalWindowId != null) {
     try {
       await chrome.windows.get(originalWindowId);
@@ -679,32 +696,49 @@ async function stopFocusMode() {
         index: Math.max(0, originalIndex ?? 0)
       });
       await chrome.tabs.update(tabId, { active: true });
-      await chrome.windows.update(originalWindowId, { focused: true });
-      moved = true;
+      await chrome.windows.update(originalWindowId, {
+        focused: true,
+        state: "normal"
+      });
+      restored = true;
     } catch (_) {}
   }
 
-  if (!moved) {
+  if (!restored) {
+    // Convert by creating a brand-new normal window with this tab
     try {
-      await chrome.windows.create({
+      const nw = await chrome.windows.create({
         tabId,
-        type: "normal",
         focused: true,
-        state: "maximized"
+        type: "normal",
+        width: Math.max(1100, session.viewport?.w || 1200),
+        height: Math.max(750, session.viewport?.h || 800)
       });
-      moved = true;
+      if (nw?.id) {
+        try {
+          await chrome.windows.update(nw.id, { state: "maximized" });
+        } catch (_) {}
+      }
+      restored = true;
     } catch (_) {
       try {
         await chrome.windows.create({ tabId, focused: true });
+        restored = true;
       } catch (__) {}
     }
   }
 
-  // 3) Close empty attract popup if it remains
+  // 3) If attract popup is empty, close it; if tab still stuck there, force move
   if (focusWindowId != null) {
     try {
       const fw = await chrome.windows.get(focusWindowId, { populate: true });
-      if (!fw.tabs || fw.tabs.length === 0) {
+      if (fw.tabs && fw.tabs.length === 1 && fw.tabs[0].id === tabId && !restored) {
+        await chrome.windows.create({
+          tabId,
+          focused: true,
+          type: "normal"
+        });
+      } else if (!fw.tabs || fw.tabs.length === 0) {
         await chrome.windows.remove(focusWindowId);
       }
     } catch (_) {}
