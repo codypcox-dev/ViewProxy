@@ -90,6 +90,16 @@ h1 {
   font-size: 12px;
 }
 
+.modes {
+  margin: 0 0 12px;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.modes strong { color: #fde68a; }
+
 code { font-size: 11px; color: #93c5fd; }
 
 .btn {

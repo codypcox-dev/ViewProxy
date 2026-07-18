@@ -1,12 +1,12 @@
 /**
- * ViewProxy — region select + exact sample loop
+ * ViewProxy — region select
  *
- * 1. Full-screen hit layer (page cannot receive clicks)
- * 2. User draws CSS-pixel box
- * 3. Overlay hidden → captureVisibleTab → crop exact box → proxy window
+ * Modes after drawing a box:
+ *  - Watch: screenshot crop → proxy window (read-only)
+ *  - Focus: re-frame the REAL tab into a tight live window (interactive)
  */
 (function () {
-  const VERSION = 1;
+  const VERSION = 2;
   const ROOT_ID = "__viewproxy_root";
   const TOAST_ID = "__viewproxy_toast";
   const YELLOW = "#facc15";
@@ -21,14 +21,14 @@
     if (!p?.action) return;
     if (p.action === "region" || p.action === "element") startSelect();
     else if (p.action === "cancel") destroyUi();
-    else if (p.action === "stop" || p.action === "follow-stop") stopStream();
+    else if (p.action === "stop" || p.action === "follow-stop") stopAll();
   };
 
   chrome.runtime.onMessage.addListener((msg) => {
-    if (msg?.type === "viewproxy-stop") stopStream();
+    if (msg?.type === "viewproxy-stop") stopAll();
   });
 
-  function toast(msg, ms = 3500) {
+  function toast(msg, ms = 3800) {
     let el = document.getElementById(TOAST_ID);
     if (!el) {
       el = document.createElement("div");
@@ -36,7 +36,7 @@
       el.style.cssText =
         "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:2147483647;" +
         "background:rgba(15,23,42,.96);color:#f8fafc;padding:10px 14px;border-radius:10px;" +
-        "font:600 13px/1.35 system-ui,sans-serif;pointer-events:none;max-width:min(92vw,520px);" +
+        "font:600 13px/1.35 system-ui,sans-serif;pointer-events:none;max-width:min(92vw,560px);" +
         "text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.4)";
       document.documentElement.appendChild(el);
     }
@@ -55,9 +55,24 @@
     document.getElementById(ROOT_ID)?.remove();
   }
 
+  function stopWatch(closeProxy = true) {
+    streaming = false;
+    if (streamTimer) clearTimeout(streamTimer);
+    streamTimer = 0;
+    streamBusy = false;
+    if (closeProxy) {
+      chrome.runtime.sendMessage({ type: "stop-exact-stream" }).catch(() => {});
+    }
+  }
+
+  function stopAll() {
+    stopWatch(true);
+    chrome.runtime.sendMessage({ type: "stop-focus-mode" }).catch(() => {});
+  }
+
   function startSelect() {
     destroyUi();
-    stopStream(false);
+    stopWatch(false);
 
     const root = document.createElement("div");
     root.id = ROOT_ID;
@@ -88,14 +103,17 @@
       "border:1px solid " +
       YELLOW +
       ";max-width:calc(100vw - 24px);pointer-events:auto";
-    bar.innerHTML =
-      '<span style="font:700 13px system-ui;color:' +
-      YELLOW +
-      '">ViewProxy — drag a box (page locked)</span>' +
-      '<button type="button" data-act="go" disabled style="border:none;border-radius:8px;background:' +
-      YELLOW +
-      ';color:#0f172a;font:700 12px system-ui;padding:8px 12px;cursor:pointer;opacity:0.45">Stream box</button>' +
-      '<button type="button" data-act="cancel" style="border:none;border-radius:8px;background:#fca5a5;color:#0f172a;font:700 12px system-ui;padding:8px 12px;cursor:pointer">Cancel</button>';
+    bar.innerHTML = `
+      <span style="font:700 13px system-ui;color:${YELLOW}">ViewProxy — drag a box</span>
+      <button type="button" data-act="watch" disabled
+        style="border:none;border-radius:8px;background:#38bdf8;color:#0f172a;font:700 12px system-ui;padding:8px 12px;cursor:pointer;opacity:0.45"
+        title="Read-only pixel stream in a proxy window">Watch</button>
+      <button type="button" data-act="focus" disabled
+        style="border:none;border-radius:8px;background:${YELLOW};color:#0f172a;font:700 12px system-ui;padding:8px 12px;cursor:pointer;opacity:0.45"
+        title="Live interactive tab clipped to this box">Focus (live)</button>
+      <button type="button" data-act="cancel"
+        style="border:none;border-radius:8px;background:#fca5a5;color:#0f172a;font:700 12px system-ui;padding:8px 12px;cursor:pointer">Cancel</button>
+    `;
     root.appendChild(bar);
     document.documentElement.appendChild(root);
 
@@ -104,7 +122,8 @@
     let y0 = 0;
     /** @type {{left:number,top:number,width:number,height:number}|null} */
     let box = null;
-    const goBtn = bar.querySelector('[data-act="go"]');
+    const watchBtn = bar.querySelector('[data-act="watch"]');
+    const focusBtn = bar.querySelector('[data-act="focus"]');
 
     function setBox(left, top, width, height) {
       const vw = window.innerWidth;
@@ -127,9 +146,11 @@
       tag.style.left = L + "px";
       tag.style.top = Math.max(0, T - 22) + "px";
       const ok = W >= 8 && H >= 8;
-      goBtn.disabled = !ok;
-      goBtn.style.opacity = ok ? "1" : "0.45";
-      goBtn.style.cursor = ok ? "pointer" : "not-allowed";
+      for (const btn of [watchBtn, focusBtn]) {
+        btn.disabled = !ok;
+        btn.style.opacity = ok ? "1" : "0.45";
+        btn.style.cursor = ok ? "pointer" : "not-allowed";
+      }
     }
 
     function isBar(el) {
@@ -208,7 +229,8 @@
         e.stopPropagation();
         const act = e.target && e.target.getAttribute && e.target.getAttribute("data-act");
         if (act === "cancel") destroyUi();
-        if (act === "go") launch();
+        if (act === "watch") launchWatch();
+        if (act === "focus") launchFocus();
       },
       true
     );
@@ -218,25 +240,30 @@
         e.preventDefault();
         e.stopPropagation();
         destroyUi();
-      } else if (e.key === "Enter" && box && box.width >= 8 && box.height >= 8) {
+      } else if (e.key === "Enter" && box && box.width >= 8) {
         e.preventDefault();
         e.stopPropagation();
-        launch();
+        // Enter defaults to Focus (live) — the clever path
+        launchFocus();
       }
     }
     window.addEventListener("keydown", onKey, true);
 
-    async function launch() {
-      if (!box || box.width < 8 || box.height < 8) {
-        toast("Drag a larger box first");
-        return;
-      }
-      const frozen = {
+    function freezeBox() {
+      return {
         left: Math.round(box.left),
         top: Math.round(box.top),
         width: Math.round(box.width),
         height: Math.round(box.height)
       };
+    }
+
+    async function launchWatch() {
+      if (!box || box.width < 8 || box.height < 8) {
+        toast("Drag a larger box first");
+        return;
+      }
+      const frozen = freezeBox();
       const viewport = { w: window.innerWidth, h: window.innerHeight };
 
       root.style.visibility = "hidden";
@@ -251,12 +278,50 @@
         });
         if (!opened?.ok) {
           destroyUi();
-          toast(opened?.error || "Failed to open proxy");
+          toast(opened?.error || "Watch mode failed");
           return;
         }
         destroyUi();
-        toast("ViewProxy " + frozen.width + "×" + frozen.height + " px");
+        toast("Watch " + frozen.width + "×" + frozen.height + " px (read-only)");
         startSampleLoop(frozen, viewport);
+      } catch (err) {
+        destroyUi();
+        toast(String(err && err.message ? err.message : err));
+      }
+    }
+
+    async function launchFocus() {
+      if (!box || box.width < 8 || box.height < 8) {
+        toast("Drag a larger box first");
+        return;
+      }
+      const frozen = freezeBox();
+      const viewport = { w: window.innerWidth, h: window.innerHeight };
+
+      // Keep overlay up until background confirms — focus needs coords BEFORE move
+      // Hide only so selection chrome is not part of the page look
+      root.style.visibility = "hidden";
+      root.style.pointerEvents = "none";
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+      try {
+        const res = await chrome.runtime.sendMessage({
+          type: "start-focus-mode",
+          pixelBox: frozen,
+          viewport
+        });
+        destroyUi();
+        if (!res?.ok) {
+          toast(res?.error || "Focus mode failed");
+          return;
+        }
+        toast(
+          "Focus " +
+            frozen.width +
+            "×" +
+            frozen.height +
+            " px · live tab · Exit Focus button top-right"
+        );
       } catch (err) {
         destroyUi();
         toast(String(err && err.message ? err.message : err));
@@ -272,17 +337,7 @@
       root.remove();
     };
 
-    toast("ViewProxy v" + VERSION + " · drag the box · page is locked");
-  }
-
-  function stopStream(closeProxy = true) {
-    streaming = false;
-    if (streamTimer) clearTimeout(streamTimer);
-    streamTimer = 0;
-    streamBusy = false;
-    if (closeProxy) {
-      chrome.runtime.sendMessage({ type: "stop-exact-stream" }).catch(() => {});
-    }
+    toast("ViewProxy v" + VERSION + " · Watch = pixels · Focus = live tab");
   }
 
   function startSampleLoop(box, viewport) {
@@ -307,7 +362,6 @@
             }
           }
         } catch (_) {
-          // one-frame failure is fine
         } finally {
           streamBusy = false;
         }

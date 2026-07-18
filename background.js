@@ -2,11 +2,9 @@
  * ViewProxy — service worker
  * Local only. No network. No analytics.
  *
- * Flow:
- *  1. Toolbar click → inject select UI on the active tab
- *  2. User draws a CSS-pixel box (page clicks blocked)
- *  3. Content script captures tab, crops exact box, sends frames
- *  4. This worker opens a proxy window and forwards frames to it
+ * Modes:
+ *  Watch  — captureVisibleTab crop → proxy window (read-only pixels)
+ *  Focus  — re-frame the REAL tab into a tight popup (live + interactive)
  */
 
 const DEFAULTS = {
@@ -20,6 +18,17 @@ let targetTabId = null;
 let proxyWindowId = null;
 /** @type {number|null} */
 let panelWindowId = null;
+
+/**
+ * @type {{
+ *   tabId: number,
+ *   originalWindowId: number,
+ *   originalIndex: number,
+ *   focusWindowId: number|null,
+ *   box: {left:number,top:number,width:number,height:number}
+ * }|null}
+ */
+let focusSession = null;
 
 chrome.runtime.onInstalled.addListener(async () => {
   const stored = await chrome.storage.local.get(null);
@@ -41,7 +50,7 @@ async function ensureMenus() {
     { id: "select", title: "Select region" },
     { id: "video", title: "Crop video…" },
     { id: "panel", title: "Open control panel" },
-    { id: "stop", title: "Stop stream" }
+    { id: "stop", title: "Stop Watch / Focus" }
   ];
   for (const item of items) {
     chrome.contextMenus.create({
@@ -52,7 +61,6 @@ async function ensureMenus() {
   }
 }
 
-// Toolbar click → select on this tab
 chrome.action.onClicked.addListener(async (tab) => {
   if (!tab?.id || !isInjectableUrl(tab.url)) {
     await openPanel();
@@ -82,12 +90,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       await openPanel();
       break;
     case "stop":
-      await stopProxy();
-      if (tabId) {
-        try {
-          await chrome.tabs.sendMessage(tabId, { type: "viewproxy-stop" });
-        } catch (_) {}
-      }
+      await stopAll(tabId);
       break;
     default:
       break;
@@ -101,12 +104,7 @@ chrome.commands.onCommand.addListener(async (command) => {
     return;
   }
   if (command === "stop-stream") {
-    await stopProxy();
-    if (tab?.id) {
-      try {
-        await chrome.tabs.sendMessage(tab.id, { type: "viewproxy-stop" });
-      } catch (_) {}
-    }
+    await stopAll(tab?.id ?? null);
     return;
   }
   if (!tab?.id || !isInjectableUrl(tab.url)) return;
@@ -133,8 +131,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ ok: false, error: "pixelBox required." });
           return;
         }
+        // Leaving focus mode if active
+        await stopFocusMode().catch(() => {});
         targetTabId = tabId;
-        const result = await startProxy({
+        const result = await startWatchProxy({
+          tabId,
+          pixelBox: message.pixelBox,
+          viewport: message.viewport || null
+        });
+        sendResponse({ ok: true, ...result });
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message || err) });
+      }
+    })();
+    return true;
+  }
+
+  if (type === "start-focus-mode") {
+    (async () => {
+      try {
+        const tabId = sender.tab?.id || targetTabId;
+        if (!tabId) {
+          sendResponse({ ok: false, error: "No tab id." });
+          return;
+        }
+        if (!message.pixelBox) {
+          sendResponse({ ok: false, error: "pixelBox required." });
+          return;
+        }
+        await stopWatchProxy().catch(() => {});
+        targetTabId = tabId;
+        const result = await startFocusMode({
           tabId,
           pixelBox: message.pixelBox,
           viewport: message.viewport || null
@@ -148,7 +175,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (type === "stop-exact-stream" || type === "exact-player-closed") {
-    stopProxy()
+    stopWatchProxy()
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
+    return true;
+  }
+
+  if (type === "stop-focus-mode") {
+    stopFocusMode()
       .then(() => sendResponse({ ok: true }))
       .catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
     return true;
@@ -174,7 +208,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  // Content script → service worker → proxy page
   if (type === "exact-frame" && message.dataUrl) {
     chrome.runtime
       .sendMessage({
@@ -200,7 +233,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         ok: true,
         tabId: tab?.id ?? null,
         title: tab?.title ?? "",
-        url: tab?.url ?? ""
+        url: tab?.url ?? "",
+        focusActive: !!focusSession
       });
     });
     return true;
@@ -221,10 +255,38 @@ chrome.windows.onRemoved.addListener((windowId) => {
   if (windowId === panelWindowId) {
     panelWindowId = null;
   }
+  // If the focus popup is closed by the user, try to restore page styles
+  // (tab may have been closed with the window)
+  if (focusSession && windowId === focusSession.focusWindowId) {
+    const tabId = focusSession.tabId;
+    focusSession = null;
+    chrome.scripting
+      .executeScript({
+        target: { tabId },
+        func: () => {
+          if (typeof window.__viewProxyFocusRestore === "function") {
+            window.__viewProxyFocusRestore();
+          }
+        }
+      })
+      .catch(() => {});
+  }
 });
 
-async function startProxy({ tabId, pixelBox, viewport }) {
-  await stopProxy();
+async function stopAll(tabId) {
+  await stopWatchProxy();
+  await stopFocusMode();
+  if (tabId) {
+    try {
+      await chrome.tabs.sendMessage(tabId, { type: "viewproxy-stop" });
+    } catch (_) {}
+  }
+}
+
+// ── Watch mode (pixel stream) ───────────────────────────────────────
+
+async function startWatchProxy({ tabId, pixelBox, viewport }) {
+  await stopWatchProxy();
 
   const vw = Math.round(viewport?.w || 1920);
   const vh = Math.round(viewport?.h || 1080);
@@ -243,19 +305,17 @@ async function startProxy({ tabId, pixelBox, viewport }) {
   targetTabId = tabId;
 
   const win = await chrome.windows.create({
-    url: chrome.runtime.getURL(
-      `player/proxy.html?w=${box.width}&h=${box.height}`
-    ),
+    url: chrome.runtime.getURL(`player/proxy.html?w=${box.width}&h=${box.height}`),
     type: "popup",
     width: Math.max(100, box.width + 16),
     height: Math.max(80, box.height + 40),
     focused: true
   });
   proxyWindowId = win?.id ?? null;
-  return { w: box.width, h: box.height, windowId: proxyWindowId };
+  return { w: box.width, h: box.height, windowId: proxyWindowId, mode: "watch" };
 }
 
-async function stopProxy() {
+async function stopWatchProxy() {
   if (proxyWindowId != null) {
     try {
       await chrome.windows.remove(proxyWindowId);
@@ -263,6 +323,152 @@ async function stopProxy() {
     proxyWindowId = null;
   }
 }
+
+// ── Focus mode (live tab re-frame) ──────────────────────────────────
+
+async function startFocusMode({ tabId, pixelBox }) {
+  await stopFocusMode();
+
+  const tab = await chrome.tabs.get(tabId);
+  if (!isInjectableUrl(tab.url)) {
+    throw new Error("Cannot focus this page.");
+  }
+
+  const box = {
+    left: Math.round(pixelBox.left),
+    top: Math.round(pixelBox.top),
+    width: Math.max(1, Math.round(pixelBox.width)),
+    height: Math.max(1, Math.round(pixelBox.height))
+  };
+
+  focusSession = {
+    tabId,
+    originalWindowId: tab.windowId,
+    originalIndex: tab.index,
+    focusWindowId: null,
+    box
+  };
+
+  await chrome.storage.local.set({ lastBox: box });
+
+  // 1) Apply framing WHILE the layout still matches the measured box
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ["content/focus.js"]
+  });
+  const applied = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (b) => {
+      if (typeof window.__viewProxyFocusApply !== "function") {
+        return { ok: false, error: "focus.js missing" };
+      }
+      return window.__viewProxyFocusApply(b);
+    },
+    args: [box]
+  });
+  if (applied?.[0]?.result && applied[0].result.ok === false) {
+    focusSession = null;
+    throw new Error(applied[0].result.error || "Focus apply failed");
+  }
+
+  // 2) Move this tab into a tight popup window (real tab, less chrome)
+  const win = await chrome.windows.create({
+    tabId,
+    type: "popup",
+    focused: true,
+    width: Math.max(120, box.width + 16),
+    height: Math.max(100, box.height + 42)
+  });
+  focusSession.focusWindowId = win?.id ?? null;
+
+  // 3) Refine outer size so client area ≈ box
+  if (win?.id) {
+    await refineFocusWindowSize(win.id, box.width, box.height);
+  }
+
+  return {
+    mode: "focus",
+    w: box.width,
+    h: box.height,
+    windowId: focusSession.focusWindowId
+  };
+}
+
+async function refineFocusWindowSize(windowId, clientW, clientH) {
+  try {
+    // First guess
+    await chrome.windows.update(windowId, {
+      width: Math.max(120, clientW + 16),
+      height: Math.max(100, clientH + 42)
+    });
+    await new Promise((r) => setTimeout(r, 80));
+
+    // Measure chrome from a script in the focused tab if possible
+    const w = await chrome.windows.get(windowId, { populate: true });
+    const tab = w.tabs && w.tabs[0];
+    if (!tab?.id) return;
+
+    const measure = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => ({
+        innerW: window.innerWidth,
+        innerH: window.innerHeight,
+        outerW: window.outerWidth,
+        outerH: window.outerHeight
+      })
+    });
+    const m = measure?.[0]?.result;
+    if (!m) return;
+
+    const chromeW = Math.max(0, m.outerW - m.innerW);
+    const chromeH = Math.max(0, m.outerH - m.innerH);
+    await chrome.windows.update(windowId, {
+      width: Math.max(120, Math.round(clientW + chromeW)),
+      height: Math.max(100, Math.round(clientH + chromeH))
+    });
+  } catch (_) {}
+}
+
+async function stopFocusMode() {
+  if (!focusSession) return;
+  const session = focusSession;
+  focusSession = null;
+
+  const { tabId, originalWindowId, originalIndex } = session;
+
+  // Restore page styles first
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["content/focus.js"]
+    });
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        if (typeof window.__viewProxyFocusRestore === "function") {
+          window.__viewProxyFocusRestore(true);
+        }
+      }
+    });
+  } catch (_) {
+    // tab may already be closed
+  }
+
+  // Move tab back to original window if it still exists
+  try {
+    await chrome.windows.get(originalWindowId);
+    await chrome.tabs.move(tabId, {
+      windowId: originalWindowId,
+      index: Math.max(0, originalIndex)
+    });
+    await chrome.tabs.update(tabId, { active: true });
+    await chrome.windows.update(originalWindowId, { focused: true });
+  } catch (_) {
+    // original window gone — leave tab where it is, just un-focused styles
+  }
+}
+
+// ── helpers ─────────────────────────────────────────────────────────
 
 async function injectSelect(tabId) {
   await chrome.scripting.executeScript({
@@ -309,13 +515,10 @@ async function handlePanelAction(payload) {
       await chrome.tabs.update(tab.id, { active: true });
     } catch (_) {}
     await injectSelect(tab.id);
-    return { ok: true, hint: "Draw a box on the page." };
+    return { ok: true, hint: "Draw a box, then Watch or Focus." };
   }
   if (action === "stop-page" || action === "stop") {
-    await stopProxy();
-    try {
-      await chrome.tabs.sendMessage(tab.id, { type: "viewproxy-stop" });
-    } catch (_) {}
+    await stopAll(tab.id);
     return { ok: true };
   }
   if (action === "freeform" || action === "pip") {
@@ -338,7 +541,7 @@ async function openPanel() {
     url: chrome.runtime.getURL("popup/popup.html"),
     type: "popup",
     width: 360,
-    height: 420,
+    height: 460,
     focused: true
   });
   panelWindowId = win?.id ?? null;
@@ -353,6 +556,12 @@ async function getTargetTab() {
       targetTabId = null;
     }
   }
+  if (focusSession?.tabId) {
+    try {
+      const t = await chrome.tabs.get(focusSession.tabId);
+      if (t) return t;
+    } catch (_) {}
+  }
   const normalWins = await chrome.windows.getAll({
     populate: false,
     windowTypes: ["normal"]
@@ -363,6 +572,18 @@ async function getTargetTab() {
     if (active && isInjectableUrl(active.url)) {
       targetTabId = active.id;
       return active;
+    }
+  }
+  // Also check popup windows (focus mode lives there)
+  const popups = await chrome.windows.getAll({
+    populate: true,
+    windowTypes: ["popup"]
+  });
+  for (const w of popups) {
+    if (w.tabs) {
+      for (const t of w.tabs) {
+        if (isInjectableUrl(t.url)) return t;
+      }
     }
   }
   return null;

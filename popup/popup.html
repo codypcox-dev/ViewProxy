@@ -11,7 +11,7 @@
     <header>
       <div>
         <h1>ViewProxy</h1>
-        <p class="tag">Local pixel stream · no tracking</p>
+        <p class="tag">Local · no tracking</p>
       </div>
       <span class="badge">offline</span>
     </header>
@@ -19,10 +19,16 @@
     <p id="target" class="target">Target: …</p>
 
     <section class="card">
-      <h2>Page region</h2>
-      <p class="help">Draw a box on the active tab. That exact pixel region streams into a proxy window.</p>
+      <h2>Select region</h2>
+      <p class="help">
+        Draw a box on the page, then choose a mode:
+      </p>
+      <ul class="modes">
+        <li><strong>Watch</strong> — read-only pixel stream in a proxy window</li>
+        <li><strong>Focus</strong> — live interactive tab clipped to the box</li>
+      </ul>
       <button type="button" id="btn-select" class="btn primary">Select region</button>
-      <button type="button" id="btn-stop" class="btn stop">Stop stream</button>
+      <button type="button" id="btn-stop" class="btn stop">Stop Watch / Focus</button>
     </section>
 
     <section class="card">
@@ -32,7 +38,7 @@
     </section>
 
     <p id="status" class="status" role="status"></p>
-    <footer>Alt+Shift+R select · Alt+Shift+S stop · Alt+Shift+C video</footer>
+    <footer>Alt+Shift+R select · Alt+Shift+S stop · Enter after draw = Focus</footer>
   </div>
   <script src="popup.js"></script>
 </body>
