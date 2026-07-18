@@ -326,7 +326,7 @@ async function stopWatchProxy() {
 
 // ── Focus mode (live tab re-frame) ──────────────────────────────────
 
-async function startFocusMode({ tabId, pixelBox }) {
+async function startFocusMode({ tabId, pixelBox, viewport }) {
   await stopFocusMode();
 
   const tab = await chrome.tabs.get(tabId);
@@ -341,49 +341,95 @@ async function startFocusMode({ tabId, pixelBox }) {
     height: Math.max(1, Math.round(pixelBox.height))
   };
 
+  // Selection-time viewport — freeze layout to this so 1:1 matches Watch
+  const vp = {
+    w: Math.round(viewport?.w || 0),
+    h: Math.round(viewport?.h || 0)
+  };
+
+  // Capture original window size so we can move without immediate reflow
+  let origWin = null;
+  try {
+    origWin = await chrome.windows.get(tab.windowId);
+  } catch (_) {}
+
+  // Measure page viewport if not provided
+  if (!vp.w || !vp.h) {
+    try {
+      const m = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => ({ w: window.innerWidth, h: window.innerHeight })
+      });
+      vp.w = m?.[0]?.result?.w || 1280;
+      vp.h = m?.[0]?.result?.h || 800;
+    } catch (_) {
+      vp.w = vp.w || 1280;
+      vp.h = vp.h || 800;
+    }
+  }
+
   focusSession = {
     tabId,
     originalWindowId: tab.windowId,
     originalIndex: tab.index,
     focusWindowId: null,
-    box
+    box,
+    viewport: vp
   };
 
-  await chrome.storage.local.set({ lastBox: box });
+  await chrome.storage.local.set({ lastBox: box, lastViewport: vp });
 
-  // 1) Apply framing WHILE the layout still matches the measured box
+  // 1) Apply framing WHILE still at full size (coords are valid)
   await chrome.scripting.executeScript({
     target: { tabId },
     files: ["content/focus.js"]
   });
   const applied = await chrome.scripting.executeScript({
     target: { tabId },
-    func: (b) => {
+    func: (b, v) => {
       if (typeof window.__viewProxyFocusApply !== "function") {
         return { ok: false, error: "focus.js missing" };
       }
-      return window.__viewProxyFocusApply(b);
+      return window.__viewProxyFocusApply(b, v);
     },
-    args: [box]
+    args: [box, vp]
   });
   if (applied?.[0]?.result && applied[0].result.ok === false) {
     focusSession = null;
     throw new Error(applied[0].result.error || "Focus apply failed");
   }
 
-  // 2) Move this tab into a tight popup window (real tab, less chrome)
+  // 2) Move tab into popup at ~original size first (keeps layout stable)
+  const startW = origWin?.width || Math.max(800, vp.w + 16);
+  const startH = origWin?.height || Math.max(600, vp.h + 80);
   const win = await chrome.windows.create({
     tabId,
     type: "popup",
     focused: true,
-    width: Math.max(120, box.width + 16),
-    height: Math.max(100, box.height + 42)
+    width: startW,
+    height: startH,
+    left: origWin?.left,
+    top: origWin?.top
   });
   focusSession.focusWindowId = win?.id ?? null;
 
-  // 3) Refine outer size so client area ≈ box
+  // Brief settle, then re-assert focus styles (in case move jostled anything)
+  await new Promise((r) => setTimeout(r, 60));
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (b, v) => {
+        if (typeof window.__viewProxyFocusApply === "function") {
+          window.__viewProxyFocusApply(b, v);
+        }
+      },
+      args: [box, vp]
+    });
+  } catch (_) {}
+
+  // 3) Shrink outer window so client area is exactly W×H (true-size like Watch)
   if (win?.id) {
-    await refineFocusWindowSize(win.id, box.width, box.height);
+    await refineFocusWindowSize(win.id, tabId, box.width, box.height);
   }
 
   return {
@@ -394,38 +440,50 @@ async function startFocusMode({ tabId, pixelBox }) {
   };
 }
 
-async function refineFocusWindowSize(windowId, clientW, clientH) {
+/**
+ * Iteratively size the popup so window.innerWidth/Height match the box
+ * (same true-size goal as Watch mode's proxy window).
+ */
+async function refineFocusWindowSize(windowId, tabId, clientW, clientH) {
   try {
-    // First guess
-    await chrome.windows.update(windowId, {
-      width: Math.max(120, clientW + 16),
-      height: Math.max(100, clientH + 42)
-    });
-    await new Promise((r) => setTimeout(r, 80));
+    // Initial guess (Win11 title bar ~32–40px, thin side chrome)
+    let outerW = Math.max(120, clientW + 16);
+    let outerH = Math.max(80, clientH + 40);
+    await chrome.windows.update(windowId, { width: outerW, height: outerH });
 
-    // Measure chrome from a script in the focused tab if possible
-    const w = await chrome.windows.get(windowId, { populate: true });
-    const tab = w.tabs && w.tabs[0];
-    if (!tab?.id) return;
+    for (let i = 0; i < 4; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      const measure = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          if (typeof window.__viewProxyFocusMeasure === "function") {
+            return window.__viewProxyFocusMeasure();
+          }
+          return {
+            innerW: window.innerWidth,
+            innerH: window.innerHeight,
+            outerW: window.outerWidth,
+            outerH: window.outerHeight
+          };
+        }
+      });
+      const m = measure?.[0]?.result;
+      if (!m) break;
 
-    const measure = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: () => ({
-        innerW: window.innerWidth,
-        innerH: window.innerHeight,
-        outerW: window.outerWidth,
-        outerH: window.outerHeight
-      })
-    });
-    const m = measure?.[0]?.result;
-    if (!m) return;
+      const chromeW = Math.max(0, m.outerW - m.innerW);
+      const chromeH = Math.max(0, m.outerH - m.innerH);
+      const nextW = Math.max(80, Math.round(clientW + chromeW));
+      const nextH = Math.max(60, Math.round(clientH + chromeH));
 
-    const chromeW = Math.max(0, m.outerW - m.innerW);
-    const chromeH = Math.max(0, m.outerH - m.innerH);
-    await chrome.windows.update(windowId, {
-      width: Math.max(120, Math.round(clientW + chromeW)),
-      height: Math.max(100, Math.round(clientH + chromeH))
-    });
+      // Close enough?
+      if (Math.abs(m.innerW - clientW) <= 2 && Math.abs(m.innerH - clientH) <= 2) {
+        break;
+      }
+
+      outerW = nextW;
+      outerH = nextH;
+      await chrome.windows.update(windowId, { width: outerW, height: outerH });
+    }
   } catch (_) {}
 }
 
