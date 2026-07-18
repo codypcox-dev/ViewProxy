@@ -1,0 +1,14 @@
+ViewProxy
+=========
+
+A private, local-only Chrome extension for streaming an exact page region
+into a floating proxy window.
+
+Optional video-PiP path includes patterns derived from Google LLC Apache-2.0
+Picture-in-Picture samples and ideas from Crop PiP (JKH-ML, Apache-2.0).
+
+This project:
+  - does not load remote code or assets
+  - does not phone home
+  - injects only when you click the extension or use a shortcut
+  - stores only local crop preferences in chrome.storage.local

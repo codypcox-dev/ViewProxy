@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ViewProxy</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>ViewProxy</h1>
+        <p class="tag">Local pixel stream · no tracking</p>
+      </div>
+      <span class="badge">offline</span>
+    </header>
+
+    <p id="target" class="target">Target: …</p>
+
+    <section class="card">
+      <h2>Page region</h2>
+      <p class="help">Draw a box on the active tab. That exact pixel region streams into a proxy window.</p>
+      <button type="button" id="btn-select" class="btn primary">Select region</button>
+      <button type="button" id="btn-stop" class="btn stop">Stop stream</button>
+    </section>
+
+    <section class="card">
+      <h2>Video</h2>
+      <p class="help">Optional: crop a <code>&lt;video&gt;</code> into native PiP.</p>
+      <button type="button" id="btn-video" class="btn ghost">Crop video</button>
+    </section>
+
+    <p id="status" class="status" role="status"></p>
+    <footer>Alt+Shift+R select · Alt+Shift+S stop · Alt+Shift+C video</footer>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
