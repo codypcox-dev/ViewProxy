@@ -110,7 +110,7 @@
         title="Read-only pixel stream in a proxy window">Watch</button>
       <button type="button" data-act="focus" disabled
         style="border:none;border-radius:8px;background:${YELLOW};color:#0f172a;font:700 12px system-ui;padding:8px 12px;cursor:pointer;opacity:0.45"
-        title="Live interactive tab clipped to this box">Focus (live)</button>
+        title="Reshape the real tab window to this box (live)">Attract</button>
       <button type="button" data-act="cancel"
         style="border:none;border-radius:8px;background:#fca5a5;color:#0f172a;font:700 12px system-ui;padding:8px 12px;cursor:pointer">Cancel</button>
     `;
@@ -316,14 +316,13 @@
           return;
         }
         toast(
-          "Focus " +
+          "Attract " +
             frozen.width +
             "×" +
             frozen.height +
-            " px · live mirror · click in proxy · Exit returns to tab"
+            " px · live window · Exit Focus returns tab to Chrome"
         );
-        // Same sample loop as Watch (true-size pixels); input is relayed separately
-        startSampleLoop(frozen, viewport);
+        // No capture loop — the tab window IS the view
       } catch (err) {
         destroyUi();
         toast(String(err && err.message ? err.message : err));
@@ -339,7 +338,7 @@
       root.remove();
     };
 
-    toast("ViewProxy v" + VERSION + " · Watch = pixels · Focus = live tab");
+    toast("ViewProxy · Watch = pixels · Attract = reshape live window");
   }
 
   function startSampleLoop(box, viewport) {

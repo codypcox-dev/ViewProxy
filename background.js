@@ -3,9 +3,9 @@
  * Local only. No network. No analytics.
  *
  * Modes:
- *  Watch  — captureVisibleTab crop → proxy window (read-only)
- *  Focus  — same true-size pixel stream + input relay into the LIVE source tab
- *           (tab stays full-size in Chrome; proxy is the interactive view)
+ *  Watch    — captureVisibleTab crop → proxy window (read-only pixels)
+ *  Attract  — freeze page layout in MAIN world, translate box to origin,
+ *             reshape the real tab's window to W×H (live + interactive)
  */
 
 const DEFAULTS = {
@@ -21,10 +21,13 @@ let proxyWindowId = null;
 let panelWindowId = null;
 
 /**
- * Focus session: source tab stays put; proxy streams + relays input.
+ * Attract/Focus session: real tab reshaped to the box.
  * @type {{
  *   tabId: number,
- *   sourceWindowId: number,
+ *   originalWindowId: number,
+ *   originalIndex: number,
+ *   originalHadOtherTabs: boolean,
+ *   focusWindowId: number|null,
  *   box: {left:number,top:number,width:number,height:number},
  *   viewport: {w:number,h:number}
  * }|null}
@@ -189,61 +192,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  // Proxy → source tab input relay (Focus mode)
-  if (type === "focus-relay" && message.payload) {
-    (async () => {
-      try {
-        let session = focusSession;
-        if (!session?.tabId) {
-          try {
-            const data = await chrome.storage.session.get("viewproxyFocusSession");
-            session = data.viewproxyFocusSession || null;
-            if (session) focusSession = session;
-          } catch (_) {}
-        }
-        if (!session?.tabId) {
-          sendResponse({ ok: false, reason: "no-session" });
-          return;
-        }
-        // Only inject file if relay fn missing (avoid wiping state)
-        const check = await chrome.scripting.executeScript({
-          target: { tabId: session.tabId },
-          func: () => typeof window.__viewProxyFocusRelay === "function"
-        });
-        if (!check?.[0]?.result) {
-          await chrome.scripting.executeScript({
-            target: { tabId: session.tabId },
-            files: ["content/focus.js"]
-          });
-          // Re-bind region after cold inject
-          await chrome.scripting.executeScript({
-            target: { tabId: session.tabId },
-            func: (b) => {
-              if (typeof window.__viewProxyFocusBeginRelay === "function") {
-                window.__viewProxyFocusBeginRelay(b);
-              }
-            },
-            args: [session.box]
-          });
-        }
-        const res = await chrome.scripting.executeScript({
-          target: { tabId: session.tabId },
-          func: (payload) => {
-            if (typeof window.__viewProxyFocusRelay === "function") {
-              return window.__viewProxyFocusRelay(payload);
-            }
-            return { ok: false };
-          },
-          args: [message.payload]
-        });
-        sendResponse(res?.[0]?.result || { ok: false });
-      } catch (err) {
-        sendResponse({ ok: false, error: String(err?.message || err) });
-      }
-    })();
-    return true;
-  }
-
   if (type === "capture-visible-tab") {
     (async () => {
       try {
@@ -307,25 +255,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 chrome.windows.onRemoved.addListener((windowId) => {
   if (windowId === proxyWindowId) {
     proxyWindowId = null;
-    // Closing the Focus/Watch proxy ends the session; bring source tab forward on Focus
-    if (focusSession) {
-      const s = focusSession;
-      focusSession = null;
-      chrome.scripting
-        .executeScript({
-          target: { tabId: s.tabId },
-          func: () => {
-            if (typeof window.__viewProxyFocusEndRelay === "function") {
-              window.__viewProxyFocusEndRelay();
-            }
-          }
-        })
-        .catch(() => {});
-      // Don't auto-focus source on X — user may just be dismissing the mirror
-    }
   }
   if (windowId === panelWindowId) {
     panelWindowId = null;
+  }
+  // Attract window closed via OS X — still restore page + return tab to Chrome
+  if (focusSession && windowId === focusSession.focusWindowId) {
+    stopFocusMode().catch(() => {});
   }
 });
 
@@ -383,8 +319,13 @@ async function stopWatchProxy() {
 }
 
 /**
- * Focus = proven true-size Watch stream + click/key relay into the LIVE source tab.
- * Source tab stays full-size in Chrome (always "up"); no CSS reframe (no black SPA shell).
+ * Attract / Focus:
+ *  1) Move tab into a popup (less chrome)
+ *  2) Freeze page metrics in MAIN world (React sees frozen innerWidth)
+ *  3) Translate content so the box sits at (0,0)
+ *  4) Resize window client area to exact box W×H
+ *
+ * The tab stays fully live — window is the crop frame.
  */
 async function startFocusMode({ tabId, pixelBox, viewport }) {
   await stopFocusMode();
@@ -406,49 +347,112 @@ async function startFocusMode({ tabId, pixelBox, viewport }) {
     h: Math.round(viewport?.h || 0) || 800
   };
 
-  // Install relay on source tab
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    files: ["content/focus.js"]
-  });
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    func: (b) => {
-      if (typeof window.__viewProxyFocusBeginRelay === "function") {
-        return window.__viewProxyFocusBeginRelay(b);
-      }
-      return { ok: false };
-    },
-    args: [box]
-  });
+  let origWin = null;
+  try {
+    origWin = await chrome.windows.get(tab.windowId);
+  } catch (_) {}
 
-  focusSession = {
+  let origTabCount = 1;
+  try {
+    origTabCount = (await chrome.tabs.query({ windowId: tab.windowId })).length;
+  } catch (_) {}
+
+  const session = {
     tabId,
-    sourceWindowId: tab.windowId,
+    originalWindowId: tab.windowId,
+    originalIndex: tab.index,
+    originalHadOtherTabs: origTabCount > 1,
+    focusWindowId: null,
     box,
     viewport: vp
   };
-  await chrome.storage.session.set({ viewproxyFocusSession: focusSession });
+  focusSession = session;
+  await chrome.storage.session.set({ viewproxyFocusSession: session });
   await chrome.storage.local.set({ lastBox: box, lastViewport: vp });
 
-  // Same true-size proxy as Watch (mode=focus enables hit layer + Exit)
-  const opened = await startWatchProxy({
-    tabId,
-    pixelBox: box,
-    viewport: vp,
-    mode: "focus"
+  // Bridge first (isolated) so Exit button postMessage works
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ["content/bridge.js"]
   });
 
+  // 1) Popup at large size (same as original when possible)
+  const startW = origWin?.width || Math.max(900, vp.w + 32);
+  const startH = origWin?.height || Math.max(700, vp.h + 100);
+  const win = await chrome.windows.create({
+    tabId,
+    type: "popup",
+    focused: true,
+    width: startW,
+    height: startH,
+    left: typeof origWin?.left === "number" ? origWin.left : undefined,
+    top: typeof origWin?.top === "number" ? origWin.top : undefined
+  });
+  session.focusWindowId = win?.id ?? null;
+  focusSession = session;
+  await chrome.storage.session.set({ viewproxyFocusSession: session });
+
+  await new Promise((r) => setTimeout(r, 100));
+
+  // 2) Measure real chrome before freeze
+  let chromeW = 16;
+  let chromeH = 40;
+  try {
+    const m = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: () => ({
+        iw: window.innerWidth,
+        ih: window.innerHeight,
+        ow: window.outerWidth,
+        oh: window.outerHeight
+      })
+    });
+    const r = m?.[0]?.result;
+    if (r?.ow && r?.iw != null) {
+      chromeW = Math.max(0, Math.min(48, r.ow - r.iw));
+      chromeH = Math.max(24, Math.min(100, r.oh - r.ih));
+    }
+  } catch (_) {}
+
+  // 3) MAIN-world attractor: freeze React metrics + translate box to origin
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    files: ["content/attractor-main.js"]
+  });
+  const applied = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: (b, v) => {
+      if (!window.__viewProxyAttractor) return { ok: false, error: "attractor missing" };
+      return window.__viewProxyAttractor.apply(b, v);
+    },
+    args: [box, vp]
+  });
+  if (applied?.[0]?.result && applied[0].result.ok === false) {
+    await stopFocusMode().catch(() => {});
+    throw new Error(applied[0].result.error || "Attract failed");
+  }
+
+  // 4) Rewrite window dimensions to the box (the attractor)
+  if (win?.id) {
+    await chrome.windows.update(win.id, {
+      width: Math.max(100, Math.round(box.width + chromeW)),
+      height: Math.max(80, Math.round(box.height + chromeH))
+    });
+  }
+
   return {
-    mode: "focus",
+    mode: "attract",
     w: box.width,
     h: box.height,
-    windowId: opened.windowId
+    windowId: session.focusWindowId
   };
 }
 
 /**
- * Exit Focus: stop proxy, end relay, bring the source tab back to the front in Chrome.
+ * Exit Focus/Attract: restore page world, put tab back in normal Chrome.
  */
 async function stopFocusMode() {
   let session = focusSession;
@@ -463,34 +467,68 @@ async function stopFocusMode() {
     await chrome.storage.session.remove("viewproxyFocusSession");
   } catch (_) {}
 
-  // Close the proxy mirror
-  await stopWatchProxy();
-
   if (!session?.tabId) return;
 
-  // End relay on source
+  const { tabId, originalWindowId, originalIndex, originalHadOtherTabs, focusWindowId } =
+    session;
+
+  // 1) Unfreeze + unwrap in MAIN world
   try {
     await chrome.scripting.executeScript({
-      target: { tabId: session.tabId },
-      files: ["content/focus.js"]
+      target: { tabId },
+      world: "MAIN",
+      files: ["content/attractor-main.js"]
     });
     await chrome.scripting.executeScript({
-      target: { tabId: session.tabId },
+      target: { tabId },
+      world: "MAIN",
       func: () => {
-        if (typeof window.__viewProxyFocusEndRelay === "function") {
-          window.__viewProxyFocusEndRelay();
+        if (window.__viewProxyAttractor) {
+          window.__viewProxyAttractor.restore({ keepExit: false });
         }
       }
     });
   } catch (_) {}
 
-  // Return user to the real tab in Chrome
-  try {
-    const t = await chrome.tabs.get(session.tabId);
-    await chrome.windows.update(t.windowId, { focused: true, state: "normal" });
-    await chrome.tabs.update(session.tabId, { active: true });
-  } catch (_) {
-    // Tab gone
+  // 2) Return tab to a normal Chrome window
+  let moved = false;
+  if (originalHadOtherTabs && originalWindowId != null) {
+    try {
+      await chrome.windows.get(originalWindowId);
+      await chrome.tabs.move(tabId, {
+        windowId: originalWindowId,
+        index: Math.max(0, originalIndex ?? 0)
+      });
+      await chrome.tabs.update(tabId, { active: true });
+      await chrome.windows.update(originalWindowId, { focused: true });
+      moved = true;
+    } catch (_) {}
+  }
+
+  if (!moved) {
+    try {
+      await chrome.windows.create({
+        tabId,
+        type: "normal",
+        focused: true,
+        state: "maximized"
+      });
+      moved = true;
+    } catch (_) {
+      try {
+        await chrome.windows.create({ tabId, focused: true });
+      } catch (__) {}
+    }
+  }
+
+  // 3) Close empty attract popup if it remains
+  if (focusWindowId != null) {
+    try {
+      const fw = await chrome.windows.get(focusWindowId, { populate: true });
+      if (!fw.tabs || fw.tabs.length === 0) {
+        await chrome.windows.remove(focusWindowId);
+      }
+    } catch (_) {}
   }
 }
 

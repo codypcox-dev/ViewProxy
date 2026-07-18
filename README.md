@@ -8,8 +8,8 @@ Private, local-only Chrome/Edge extension. No network, no analytics, no remote c
 
 | Mode | What it does | Interactive? | Best for |
 |---|---|---|---|
-| **Watch** | True-size pixel crop → full-bleed proxy | No (read-only) | Monitoring meters, dashboards |
-| **Focus** | Same true-size stream **+** clicks/keys relayed into the live source tab | **Yes** | Interacting while the real tab stays fully running |
+| **Watch** | True-size pixel crop → full-bleed proxy window | No (read-only) | Monitoring |
+| **Attract** | Freezes page layout metrics in the **page main world**, translates the box to `(0,0)`, reshapes the **real tab window** to W×H | **Yes** (real DOM) | Live widgets; “drag the browser to the box” |
 
 ## Install (unpacked)
 
@@ -36,18 +36,19 @@ Private, local-only Chrome/Edge extension. No network, no analytics, no remote c
 | `Alt+Shift+S` | Stop Watch / Focus |
 | `Alt+Shift+C` | Crop a `<video>` into native PiP |
 
-## How Focus works
+## How Attract works
 
-CSS re-frame of SPAs (Grok, etc.) went black — they reflow when the window shrinks.
+Manual “drag the Chrome edges around the widget” feels right but SPAs reflow when `innerWidth` changes.
 
-Focus instead uses the **same true-size Watch pipeline**, then:
+Attract does that **without** the reflow:
 
-1. Source tab stays full-size in Chrome (always live)  
-2. Proxy shows the exact pixel box (1:1, full-bleed)  
-3. Clicks / wheel / keys in the proxy are **relayed** into the source tab at mapped coordinates  
-4. **✕ Exit Focus** closes the proxy and **focuses the source tab in Chrome**  
+1. Record box + viewport size at selection time  
+2. Inject into the **page main world** (where React runs) and freeze `innerWidth` / `innerHeight` to the old viewport  
+3. Wrap page content and `translate(-left, -top)` so the box sits at the origin  
+4. Move the tab into a tight popup and set outer size so the **client area is the box**  
+5. Exit restores freezes, unwraps the DOM, and puts the tab back in a normal Chrome window  
 
-**Limits:** Source tab should stay open (and ideally still the active tab in its window) for fresh captures. Synthetic events don’t cover every site interaction (canvas games, etc.).
+**Limits:** OS title bar remains. Some sites ignore freezes or use workers for layout. Not every fixed-position shell will look perfect.
 
 ## How Watch works
 
