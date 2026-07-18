@@ -193,15 +193,39 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (type === "focus-relay" && message.payload) {
     (async () => {
       try {
-        const session = focusSession;
+        let session = focusSession;
         if (!session?.tabId) {
-          sendResponse({ ok: false });
+          try {
+            const data = await chrome.storage.session.get("viewproxyFocusSession");
+            session = data.viewproxyFocusSession || null;
+            if (session) focusSession = session;
+          } catch (_) {}
+        }
+        if (!session?.tabId) {
+          sendResponse({ ok: false, reason: "no-session" });
           return;
         }
-        await chrome.scripting.executeScript({
+        // Only inject file if relay fn missing (avoid wiping state)
+        const check = await chrome.scripting.executeScript({
           target: { tabId: session.tabId },
-          files: ["content/focus.js"]
+          func: () => typeof window.__viewProxyFocusRelay === "function"
         });
+        if (!check?.[0]?.result) {
+          await chrome.scripting.executeScript({
+            target: { tabId: session.tabId },
+            files: ["content/focus.js"]
+          });
+          // Re-bind region after cold inject
+          await chrome.scripting.executeScript({
+            target: { tabId: session.tabId },
+            func: (b) => {
+              if (typeof window.__viewProxyFocusBeginRelay === "function") {
+                window.__viewProxyFocusBeginRelay(b);
+              }
+            },
+            args: [session.box]
+          });
+        }
         const res = await chrome.scripting.executeScript({
           target: { tabId: session.tabId },
           func: (payload) => {
