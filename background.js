@@ -316,36 +316,43 @@ async function handleAttractBoundsChanged(win) {
   const session = focusSession;
   if (!session || win.id !== session.focusWindowId) return;
   if (session.ignoreBounds) return;
-  if (session.cropResize === false) {
-    // Still fluid-fill to new client size (normal Windows top-left anchor)
-    await applyAttractFill(session.tabId, session.box.width, session.box.height);
-    session.lastBounds = {
-      left: win.left,
-      top: win.top,
-      width: win.width,
-      height: win.height
-    };
-    return;
-  }
 
   const prev = session.lastBounds;
-  session.lastBounds = {
+  const nextBounds = {
     left: win.left,
     top: win.top,
     width: win.width,
     height: win.height
   };
-  if (!prev || prev.left == null) return;
+
+  if (session.cropResize === false) {
+    // Still fluid-fill to new client size (width-flush + vertical center)
+    session.lastBounds = nextBounds;
+    await applyAttractFill(session.tabId, session.box.width, session.box.height);
+    return;
+  }
+
+  if (!prev || prev.left == null) {
+    session.lastBounds = nextBounds;
+    return;
+  }
 
   const dLeft = (win.left ?? 0) - (prev.left ?? 0);
   const dTop = (win.top ?? 0) - (prev.top ?? 0);
   const dWidth = (win.width ?? 0) - (prev.width ?? 0);
   const dHeight = (win.height ?? 0) - (prev.height ?? 0);
 
-  // Ignore no-ops / tiny jitter
+  session.lastBounds = nextBounds;
+
+  // Ignore no-ops / pure jitter
   if (dLeft === 0 && dTop === 0 && dWidth === 0 && dHeight === 0) return;
 
-  // Update crop origin/size in MAIN world (top edge → consume top content)
+  // Pure move (title-bar drag): no crop, no reflow needed
+  if (dWidth === 0 && dHeight === 0) return;
+
+  // Update crop origin/size in MAIN world
+  //   L/R size change → scale only (L/W fixed)
+  //   T/B size change → crop T/H
   try {
     const res = await chrome.scripting.executeScript({
       target: { tabId: session.tabId },
@@ -363,7 +370,7 @@ async function handleAttractBoundsChanged(win) {
     }
   } catch (_) {}
 
-  // Re-fill so the (possibly new) box fills the client area
+  // Always re-fill: width-flush L/R + vertical center for new client size
   await applyAttractFill(session.tabId, session.box.width, session.box.height);
 }
 
@@ -616,11 +623,17 @@ async function applyAttractFill(tabId, boxW, boxH, realW, realH) {
       const m = await chrome.scripting.executeScript({
         target: { tabId },
         world: "ISOLATED",
-        func: () => ({
-          // Prefer visualViewport if present (true layout viewport)
-          iw: window.visualViewport?.width || window.innerWidth,
-          ih: window.visualViewport?.height || window.innerHeight
-        })
+        func: () => {
+          // True client viewport (MAIN world freezes these for the page)
+          const vv = window.visualViewport;
+          const iw = Math.round(
+            vv?.width || document.documentElement?.clientWidth || window.innerWidth || 0
+          );
+          const ih = Math.round(
+            vv?.height || document.documentElement?.clientHeight || window.innerHeight || 0
+          );
+          return { iw, ih };
+        }
       });
       realW = m?.[0]?.result?.iw;
       realH = m?.[0]?.result?.ih;

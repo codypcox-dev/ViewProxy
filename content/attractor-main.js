@@ -3,9 +3,10 @@
  *
  * Layout rules (user spec):
  *  - Content NEVER leaves left/right of the viewport (always width-flush)
- *  - Content stays vertically centered
+ *  - Content stays fluidly centered on the vertical axis
  *  - Left/right window edges → scale (zoom) toward center; crop L/W unchanged
- *  - Top/bottom window edges → crop (consume/reveal content); T/H change
+ *  - Top/bottom window edges → crop (consume/reveal); T/H change
+ *  - Pure window move (no size change) → no crop change
  */
 (function () {
   const STYLE_ID = "__viewproxy_attr_style";
@@ -14,7 +15,7 @@
   const FLAG = "__viewproxy_attr";
 
   const api = {
-    version: 5,
+    version: 6,
     state: null,
 
     apply(box, viewport) {
@@ -38,11 +39,14 @@
         fillScaleY: 1,
         centerX: 0,
         centerY: 0,
+        lastRealW: W,
+        lastRealH: H,
         cropResize: true,
         scrollX: window.scrollX,
         scrollY: window.scrollY,
         patches: [],
         resizeStop: null,
+        scrollLock: null,
         stageCreated: false,
         meta: null,
         metaCreated: false
@@ -65,6 +69,7 @@
         } catch (_) {}
       }
 
+      // Freeze layout metrics so React/layout see the original page size
       patch(window, "innerWidth", layoutW);
       patch(window, "innerHeight", layoutH);
       patch(window, "outerWidth", layoutW);
@@ -89,6 +94,14 @@
       };
       window.addEventListener("resize", state.resizeStop, true);
       window.addEventListener("orientationchange", state.resizeStop, true);
+
+      // Keep document pinned at 0,0 so stage origin is stable
+      state.scrollLock = function () {
+        try {
+          if (window.scrollX !== 0 || window.scrollY !== 0) window.scrollTo(0, 0);
+        } catch (_) {}
+      };
+      window.addEventListener("scroll", state.scrollLock, true);
 
       let meta = document.querySelector('meta[name="viewport"]');
       if (meta) {
@@ -128,36 +141,48 @@
       }
 
       /**
-       * Rightmost first: translate crop→origin, scale (width-driven), then vertical center.
-       * Horizontal: always flush L/R (cx = 0 when sx = realW/W).
+       * Matrix (rightmost first): crop→origin, uniform scale, then place.
+       * Width-flush: sx = realW/W, cx = 0  → left at 0, right at realW.
+       * Vertical center: cy = (realH - H*sy) / 2  → crop center at realH/2.
        */
       function applyStageTransform(sx, sy, cx, cy) {
         const s = api.state || state;
         cx = cx != null ? cx : 0;
         cy = cy != null ? cy : s.centerY || 0;
+        // Fixed to viewport so body flow / reflow cannot drift the stage
         stage.style.cssText = [
           "display:block",
-          "position:relative",
+          "position:fixed",
+          "left:0",
+          "top:0",
+          "right:auto",
+          "bottom:auto",
           "box-sizing:border-box",
-          "transform:translate(" +
+          "margin:0",
+          "padding:0",
+          "border:0",
+          "transform:translate3d(" +
             cx +
             "px," +
             cy +
-            "px) scale(" +
+            "px,0) scale(" +
             sx +
             "," +
             sy +
-            ") translate(" +
+            ") translate3d(" +
             -s.L +
             "px," +
             -s.T +
-            "px)",
+            "px,0)",
           "transform-origin:0 0",
           "width:" + s.layoutW + "px",
           "min-width:" + s.layoutW + "px",
-          "margin:0",
-          "padding:0",
-          "will-change:transform"
+          "height:" + s.layoutH + "px",
+          "min-height:" + s.layoutH + "px",
+          "overflow:visible",
+          "will-change:transform",
+          "z-index:0",
+          "pointer-events:auto"
         ].join(";");
       }
       state.applyStageTransform = applyStageTransform;
@@ -175,11 +200,18 @@
           margin: 0 !important;
           padding: 0 !important;
           background: #0a0a0a !important;
-        }
-        html.${FLAG} body {
           width: 100% !important;
           height: 100% !important;
-          position: relative !important;
+          max-width: 100% !important;
+          max-height: 100% !important;
+        }
+        html.${FLAG} {
+          position: fixed !important;
+          inset: 0 !important;
+        }
+        html.${FLAG} body {
+          position: fixed !important;
+          inset: 0 !important;
         }
         #${EXIT_ID} {
           position: fixed !important;
@@ -296,10 +328,13 @@
     },
 
     /**
-     * Width-flush + vertical center:
-     *   sx = sy = realW / W   (always touch left & right)
+     * Width-flush + vertical center (always):
+     *   sx = sy = realW / W     → left edge at 0, right at realW (never leave L/R)
      *   cx = 0
-     *   cy = (realH - H*sy) / 2
+     *   cy = (realH - H*sy) / 2 → crop center sits on vertical midline
+     *
+     * Tall windows: black bars above/below, content centered.
+     * Short windows: top/bottom of scaled crop crop out of view, still centered.
      */
     setFill(realW, realH) {
       const state = api.state;
@@ -310,18 +345,20 @@
       const W = Math.max(1, state.W);
       const H = Math.max(1, state.H);
 
-      // Never leave left/right: scale uniformly by WIDTH
+      // Never leave left/right: uniform scale driven by WIDTH only
       const s = realW / W;
       const sx = s;
       const sy = s;
       const cx = 0;
-      // Fluid vertical center
-      const cy = (realH - H * sy) / 2;
+      // Fluid vertical center (can be negative → T/B crop out of view)
+      const cy = Math.round((realH - H * sy) / 2);
 
       state.fillScaleX = sx;
       state.fillScaleY = sy;
       state.centerX = cx;
       state.centerY = cy;
+      state.lastRealW = realW;
+      state.lastRealH = realH;
       state.applyStageTransform(sx, sy, cx, cy);
       return { ok: true, sx, sy, cx, cy, realW, realH, W, H, L: state.L, T: state.T };
     },
@@ -329,33 +366,42 @@
     /**
      * Window bounds deltas (chrome.windows DIP).
      *
-     * Left/right: do NOT change L/W — only window size changes → setFill scales toward center.
-     * Top/bottom: crop T/H (top edge consumes top content, bottom consumes bottom).
+     * - Pure move (dWidth=dHeight=0): no-op on crop
+     * - Left/right size change: L/W fixed → setFill scales toward center
+     * - Top/bottom size change: crop T/H (top edge consumes top, bottom consumes bottom)
+     * - Diagonal: vertical crop + horizontal scale (never crop L/W)
      */
     applyBoundsDelta(dLeft, dTop, dWidth, dHeight) {
       const state = api.state;
       if (!state) return { ok: false };
 
-      // Horizontal resize → scale only (caller will setFill). Keep crop L/W fixed
-      // unless cropResize is off entirely.
-      const horizontalOnly =
-        dTop === 0 && dHeight === 0 && (dLeft !== 0 || dWidth !== 0);
+      const sizeChanged = dWidth !== 0 || dHeight !== 0;
+      if (!sizeChanged) {
+        // Dragging the window title bar — do not touch crop or scale
+        return {
+          ok: true,
+          cropResize: !!state.cropResize,
+          box: api.getBox(),
+          scaleOnly: true,
+          moved: true
+        };
+      }
 
       if (!state.cropResize) {
         return { ok: true, cropResize: false, box: api.getBox(), scaleOnly: true };
       }
 
-      if (horizontalOnly) {
-        // L/R edges: scale toward center via setFill only
+      // Horizontal-only resize: scale via setFill only
+      if (dHeight === 0) {
         return { ok: true, cropResize: true, box: api.getBox(), scaleOnly: true };
       }
 
-      // Vertical (and diagonal): apply top/bottom crop. Ignore horizontal crop of L/W
-      // so left/right never "eat" horizontal content — only scale.
+      // Vertical (or diagonal) size change: crop top/bottom only
+      // dTop moves the top edge of the window → consume/reveal top content
+      // dHeight is the net height change (bottom edge alone → dTop=0)
       let T = state.T + dTop;
       let H = state.H + dHeight;
 
-      // If diagonal, still only vertical crop; width stays
       const MIN = 40;
       if (H < MIN) {
         if (dTop > 0) T -= MIN - H;
@@ -366,14 +412,15 @@
 
       state.T = Math.round(T);
       state.H = Math.round(H);
-      // L, W unchanged — horizontal flush preserved
+      // L, W never change — left/right always scale, never crop
 
-      state.applyStageTransform(
-        state.fillScaleX || 1,
-        state.fillScaleY || 1,
-        0,
-        state.centerY || 0
-      );
+      // Provisional transform; setFill immediately after will re-center
+      const sx = state.fillScaleX || 1;
+      const sy = state.fillScaleY || 1;
+      const realH = state.lastRealH || H * sy;
+      const cy = Math.round((realH - state.H * sy) / 2);
+      state.centerY = cy;
+      state.applyStageTransform(sx, sy, 0, cy);
 
       return {
         ok: true,
@@ -409,6 +456,9 @@
         window.removeEventListener("resize", state.resizeStop, true);
         window.removeEventListener("orientationchange", state.resizeStop, true);
       }
+      if (state.scrollLock) {
+        window.removeEventListener("scroll", state.scrollLock, true);
+      }
 
       for (const p of state.patches) {
         try {
@@ -432,9 +482,13 @@
       if (!keepExit) document.getElementById(EXIT_ID)?.remove();
       document.documentElement.classList.remove(FLAG);
       document.documentElement.style.overflow = "";
+      document.documentElement.style.position = "";
+      document.documentElement.style.inset = "";
       if (document.body) {
         document.body.style.overflow = "";
         document.body.style.margin = "";
+        document.body.style.position = "";
+        document.body.style.inset = "";
       }
 
       const stage = document.getElementById(STAGE_ID);
