@@ -24,9 +24,10 @@ Private, local-only Chrome/Edge extension. No network, no analytics, no remote c
 3. Drag a yellow box (page clicks are blocked while selecting)  
 4. Choose:
    - **Watch** — read-only pixel proxy  
-   - **Focus (live)** — real tab clipped to the box  
-5. **Enter** after drawing defaults to **Focus**  
-6. In Focus mode, use **✕ Exit Focus** (top-right) or **Alt+Shift+S** to restore  
+   - **Attract** — reshape the live tab window to the box  
+5. **Enter** after drawing defaults to **Attract**  
+6. In Attract mode: **✕ Exit Focus** returns the tab to a normal Chrome window  
+
 
 ### Shortcuts
 
