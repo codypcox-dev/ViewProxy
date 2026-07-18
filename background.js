@@ -341,19 +341,23 @@ async function startFocusMode({ tabId, pixelBox, viewport }) {
     height: Math.max(1, Math.round(pixelBox.height))
   };
 
-  // Selection-time viewport — freeze layout to this so 1:1 matches Watch
   const vp = {
     w: Math.round(viewport?.w || 0),
     h: Math.round(viewport?.h || 0)
   };
 
-  // Capture original window size so we can move without immediate reflow
   let origWin = null;
   try {
     origWin = await chrome.windows.get(tab.windowId);
   } catch (_) {}
 
-  // Measure page viewport if not provided
+  // Count tabs in original window — if this is the only tab, window dies on move
+  let origTabCount = 1;
+  try {
+    const tabsInOrig = await chrome.tabs.query({ windowId: tab.windowId });
+    origTabCount = tabsInOrig.length;
+  } catch (_) {}
+
   if (!vp.w || !vp.h) {
     try {
       const m = await chrome.scripting.executeScript({
@@ -368,18 +372,58 @@ async function startFocusMode({ tabId, pixelBox, viewport }) {
     }
   }
 
-  focusSession = {
+  const session = {
     tabId,
     originalWindowId: tab.windowId,
     originalIndex: tab.index,
+    originalHadOtherTabs: origTabCount > 1,
     focusWindowId: null,
     box,
     viewport: vp
   };
-
+  focusSession = session;
+  await chrome.storage.session.set({ viewproxyFocusSession: session });
   await chrome.storage.local.set({ lastBox: box, lastViewport: vp });
 
-  // 1) Apply framing WHILE still at full size (coords are valid)
+  // 1) Move into popup at original size FIRST (no freeze yet — measure real chrome)
+  const startW = origWin?.width || Math.max(900, vp.w + 32);
+  const startH = origWin?.height || Math.max(700, vp.h + 100);
+  const win = await chrome.windows.create({
+    tabId,
+    type: "popup",
+    focused: true,
+    width: startW,
+    height: startH,
+    left: typeof origWin?.left === "number" ? origWin.left : undefined,
+    top: typeof origWin?.top === "number" ? origWin.top : undefined
+  });
+  session.focusWindowId = win?.id ?? null;
+  focusSession = session;
+  await chrome.storage.session.set({ viewproxyFocusSession: session });
+
+  await new Promise((r) => setTimeout(r, 80));
+
+  // 2) Measure real popup chrome BEFORE freezing metrics
+  let chromeW = 16;
+  let chromeH = 40;
+  try {
+    const m = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => ({
+        iw: window.innerWidth,
+        ih: window.innerHeight,
+        ow: window.outerWidth,
+        oh: window.outerHeight
+      })
+    });
+    const r = m?.[0]?.result;
+    if (r?.ow && r?.iw) {
+      chromeW = Math.max(0, Math.min(40, r.ow - r.iw));
+      chromeH = Math.max(24, Math.min(100, r.oh - r.ih));
+    }
+  } catch (_) {}
+
+  // 3) Apply focus framing (freeze SPA metrics + translate stage to box)
   await chrome.scripting.executeScript({
     target: { tabId },
     files: ["content/focus.js"]
@@ -395,106 +439,46 @@ async function startFocusMode({ tabId, pixelBox, viewport }) {
     args: [box, vp]
   });
   if (applied?.[0]?.result && applied[0].result.ok === false) {
-    focusSession = null;
+    // Roll back window move
+    await stopFocusMode().catch(() => {});
     throw new Error(applied[0].result.error || "Focus apply failed");
   }
 
-  // 2) Move tab into popup at ~original size first (keeps layout stable)
-  const startW = origWin?.width || Math.max(800, vp.w + 16);
-  const startH = origWin?.height || Math.max(600, vp.h + 80);
-  const win = await chrome.windows.create({
-    tabId,
-    type: "popup",
-    focused: true,
-    width: startW,
-    height: startH,
-    left: origWin?.left,
-    top: origWin?.top
-  });
-  focusSession.focusWindowId = win?.id ?? null;
-
-  // Brief settle, then re-assert focus styles (in case move jostled anything)
-  await new Promise((r) => setTimeout(r, 60));
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      func: (b, v) => {
-        if (typeof window.__viewProxyFocusApply === "function") {
-          window.__viewProxyFocusApply(b, v);
-        }
-      },
-      args: [box, vp]
-    });
-  } catch (_) {}
-
-  // 3) Shrink outer window so client area is exactly W×H (true-size like Watch)
+  // 4) True-size window: client ≈ box (same goal as Watch)
   if (win?.id) {
-    await refineFocusWindowSize(win.id, tabId, box.width, box.height);
+    await chrome.windows.update(win.id, {
+      width: Math.max(100, Math.round(box.width + chromeW)),
+      height: Math.max(80, Math.round(box.height + chromeH))
+    });
   }
 
   return {
     mode: "focus",
     w: box.width,
     h: box.height,
-    windowId: focusSession.focusWindowId
+    windowId: session.focusWindowId
   };
 }
 
-/**
- * Iteratively size the popup so window.innerWidth/Height match the box
- * (same true-size goal as Watch mode's proxy window).
- */
-async function refineFocusWindowSize(windowId, tabId, clientW, clientH) {
-  try {
-    // Initial guess (Win11 title bar ~32–40px, thin side chrome)
-    let outerW = Math.max(120, clientW + 16);
-    let outerH = Math.max(80, clientH + 40);
-    await chrome.windows.update(windowId, { width: outerW, height: outerH });
-
-    for (let i = 0; i < 4; i++) {
-      await new Promise((r) => setTimeout(r, 50));
-      const measure = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: () => {
-          if (typeof window.__viewProxyFocusMeasure === "function") {
-            return window.__viewProxyFocusMeasure();
-          }
-          return {
-            innerW: window.innerWidth,
-            innerH: window.innerHeight,
-            outerW: window.outerWidth,
-            outerH: window.outerHeight
-          };
-        }
-      });
-      const m = measure?.[0]?.result;
-      if (!m) break;
-
-      const chromeW = Math.max(0, m.outerW - m.innerW);
-      const chromeH = Math.max(0, m.outerH - m.innerH);
-      const nextW = Math.max(80, Math.round(clientW + chromeW));
-      const nextH = Math.max(60, Math.round(clientH + chromeH));
-
-      // Close enough?
-      if (Math.abs(m.innerW - clientW) <= 2 && Math.abs(m.innerH - clientH) <= 2) {
-        break;
-      }
-
-      outerW = nextW;
-      outerH = nextH;
-      await chrome.windows.update(windowId, { width: outerW, height: outerH });
-    }
-  } catch (_) {}
-}
-
 async function stopFocusMode() {
-  if (!focusSession) return;
-  const session = focusSession;
+  // Prefer in-memory session; fall back to session storage
+  let session = focusSession;
+  if (!session) {
+    try {
+      const data = await chrome.storage.session.get("viewproxyFocusSession");
+      session = data.viewproxyFocusSession || null;
+    } catch (_) {}
+  }
   focusSession = null;
+  try {
+    await chrome.storage.session.remove("viewproxyFocusSession");
+  } catch (_) {}
 
-  const { tabId, originalWindowId, originalIndex } = session;
+  if (!session?.tabId) return;
 
-  // Restore page styles first
+  const { tabId, originalWindowId, originalIndex, originalHadOtherTabs } = session;
+
+  // 1) Restore page CSS / unfreeze metrics
   try {
     await chrome.scripting.executeScript({
       target: { tabId },
@@ -508,21 +492,55 @@ async function stopFocusMode() {
         }
       }
     });
-  } catch (_) {
-    // tab may already be closed
+  } catch (_) {}
+
+  // 2) Return tab to a normal Chrome window
+  let moved = false;
+
+  // Prefer original window if it still exists (had other tabs)
+  if (originalHadOtherTabs && originalWindowId != null) {
+    try {
+      await chrome.windows.get(originalWindowId);
+      await chrome.tabs.move(tabId, {
+        windowId: originalWindowId,
+        index: Math.max(0, originalIndex ?? 0)
+      });
+      await chrome.tabs.update(tabId, { active: true });
+      await chrome.windows.update(originalWindowId, { focused: true });
+      moved = true;
+    } catch (_) {}
   }
 
-  // Move tab back to original window if it still exists
-  try {
-    await chrome.windows.get(originalWindowId);
-    await chrome.tabs.move(tabId, {
-      windowId: originalWindowId,
-      index: Math.max(0, originalIndex)
-    });
-    await chrome.tabs.update(tabId, { active: true });
-    await chrome.windows.update(originalWindowId, { focused: true });
-  } catch (_) {
-    // original window gone — leave tab where it is, just un-focused styles
+  if (!moved) {
+    // Original window gone (or was single-tab) → open a new normal window with this tab
+    try {
+      await chrome.windows.create({
+        tabId,
+        type: "normal",
+        focused: true,
+        state: "maximized"
+      });
+      moved = true;
+    } catch (_) {
+      try {
+        // Last resort: normal window without maximize
+        await chrome.windows.create({
+          tabId,
+          focused: true
+        });
+        moved = true;
+      } catch (__) {}
+    }
+  }
+
+  // 3) If an empty focus popup remains, close it
+  if (session.focusWindowId != null) {
+    try {
+      const fw = await chrome.windows.get(session.focusWindowId, { populate: true });
+      if (!fw.tabs || fw.tabs.length === 0) {
+        await chrome.windows.remove(session.focusWindowId);
+      }
+    } catch (_) {}
   }
 }
 

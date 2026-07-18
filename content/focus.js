@@ -1,25 +1,29 @@
 /**
- * ViewProxy Focus — true-size live re-frame
+ * ViewProxy Focus — live true-size re-frame for SPAs
  *
- * Critical: do NOT set html/body layout width to the box size.
- * That reflows SPAs (black empty shells). Freeze layout at the
- * pre-focus viewport width, translate so the box sits at (0,0),
- * then let the OS window client area be exactly W×H (like Watch).
+ * Why things went black before:
+ *  shrinking the window makes React/Grok re-layout for a tiny viewport.
+ *
+ * Fix:
+ *  1) Freeze window.innerWidth/Height (+ clientWidth) to selection-time size
+ *  2) Block resize events from reaching the page
+ *  3) Wrap page content and translate so the box sits at (0,0)
+ *  4) Let the OS window clip to W×H (true size) without reflow
  */
 (function () {
   const STYLE_ID = "__viewproxy_focus_style";
+  const STAGE_ID = "__viewproxy_focus_stage";
   const EXIT_ID = "__viewproxy_focus_exit";
   const FLAG = "__viewproxy_focus";
 
   /**
    * @param {{left:number,top:number,width:number,height:number}} box
-   * @param {{w:number,h:number}|null} viewport  selection-time inner size
+   * @param {{w:number,h:number}|null} viewport
    */
   window.__viewProxyFocusApply = function apply(box, viewport) {
     if (!box || box.width < 2 || box.height < 2) {
       throw new Error("Invalid focus box");
     }
-
     if (window.__viewProxyFocusState) {
       restore(false);
     }
@@ -28,88 +32,127 @@
     const T = Math.round(box.top);
     const W = Math.max(1, Math.round(box.width));
     const H = Math.max(1, Math.round(box.height));
-
-    // Freeze layout to the viewport that produced L/T/W/H
     const layoutW = Math.max(
       W,
-      Math.round(viewport?.w || window.innerWidth || document.documentElement.clientWidth || 1280)
+      Math.round(viewport?.w || window.innerWidth || 1280)
     );
     const layoutH = Math.max(
       H,
-      Math.round(viewport?.h || window.innerHeight || document.documentElement.clientHeight || 800)
+      Math.round(viewport?.h || window.innerHeight || 800)
     );
 
     const state = {
       scrollX: window.scrollX,
       scrollY: window.scrollY,
-      htmlOverflow: document.documentElement.style.overflow,
-      htmlWidth: document.documentElement.style.width,
-      htmlMinWidth: document.documentElement.style.minWidth,
-      htmlHeight: document.documentElement.style.height,
-      htmlMaxHeight: document.documentElement.style.maxHeight,
-      bodyOverflow: document.body ? document.body.style.overflow : "",
-      bodyTransform: document.body ? document.body.style.transform : "",
-      bodyOrigin: document.body ? document.body.style.transformOrigin : "",
-      bodyWidth: document.body ? document.body.style.width : "",
-      bodyMinWidth: document.body ? document.body.style.minWidth : "",
-      bodyMargin: document.body ? document.body.style.margin : "",
-      bodyPadding: document.body ? document.body.style.padding : "",
-      box: { left: L, top: T, width: W, height: H },
       layoutW,
-      layoutH
+      layoutH,
+      box: { left: L, top: T, width: W, height: H },
+      patched: [],
+      resizeHandler: null,
+      stageCreated: false
     };
 
-    // Optional: pin visual viewport meta so some mobile-ish pages don't reflow
-    let metaVp = document.querySelector('meta[name="viewport"]');
-    if (metaVp) {
-      state.metaViewport = metaVp.getAttribute("content");
-      metaVp.setAttribute("content", "width=" + layoutW + ", initial-scale=1, maximum-scale=1");
-    } else {
-      metaVp = document.createElement("meta");
-      metaVp.name = "viewport";
-      metaVp.content = "width=" + layoutW + ", initial-scale=1, maximum-scale=1";
-      metaVp.setAttribute("data-viewproxy", "1");
-      (document.head || document.documentElement).appendChild(metaVp);
-      state.metaViewportCreated = true;
+    // ── freeze viewport metrics (stops SPA reflow) ─────────────────
+    function patchGetter(obj, key, value) {
+      try {
+        const existing = Object.getOwnPropertyDescriptor(obj, key);
+        // Also try prototype
+        state.patched.push({ obj, key, existing, own: true });
+        Object.defineProperty(obj, key, {
+          configurable: true,
+          enumerable: true,
+          get() {
+            return value;
+          }
+        });
+        return true;
+      } catch (_) {
+        return false;
+      }
     }
 
+    // Patch on window — native getters are often on the instance
+    patchGetter(window, "innerWidth", layoutW);
+    patchGetter(window, "innerHeight", layoutH);
+    patchGetter(window, "outerWidth", layoutW);
+    patchGetter(window, "outerHeight", layoutH);
+    try {
+      patchGetter(document.documentElement, "clientWidth", layoutW);
+      patchGetter(document.documentElement, "clientHeight", layoutH);
+      patchGetter(document.documentElement, "scrollWidth", layoutW);
+      patchGetter(document.documentElement, "scrollHeight", layoutH);
+    } catch (_) {}
+
+    // Swallow resize so React doesn't re-layout mid-focus
+    state.resizeHandler = function stopResize(e) {
+      e.stopImmediatePropagation();
+      e.preventDefault();
+    };
+    window.addEventListener("resize", state.resizeHandler, true);
+    window.addEventListener("orientationchange", state.resizeHandler, true);
+
+    // ── wrap page content so transform doesn't fight fixed headers ──
+    const body = document.body;
+    if (!body) throw new Error("No document.body");
+
+    let stage = document.getElementById(STAGE_ID);
+    if (!stage) {
+      stage = document.createElement("div");
+      stage.id = STAGE_ID;
+      // Move all current body children into the stage
+      const move = [];
+      for (const child of Array.from(body.childNodes)) {
+        if (child.nodeType === 1) {
+          const id = child.id;
+          if (id === STAGE_ID || id === STYLE_ID || id === EXIT_ID) continue;
+        }
+        move.push(child);
+      }
+      for (const n of move) stage.appendChild(n);
+      body.insertBefore(stage, body.firstChild);
+      state.stageCreated = true;
+    }
+
+    stage.style.cssText = [
+      "display:block",
+      "position:relative",
+      "transform:translate(" + -L + "px," + -T + "px)",
+      "transform-origin:0 0",
+      "width:" + layoutW + "px",
+      "min-width:" + layoutW + "px",
+      "margin:0",
+      "padding:0",
+      "will-change:transform"
+    ].join(";");
+
+    // ── clip the real viewport to the window (W×H after resize) ─────
     const css = `
-      html.${FLAG} {
+      html.${FLAG}, html.${FLAG} body {
         overflow: hidden !important;
-        /* KEEP full layout width — window size provides the crop, not reflow */
-        width: ${layoutW}px !important;
-        min-width: ${layoutW}px !important;
-        max-width: none !important;
-        height: ${layoutH}px !important;
-        min-height: ${layoutH}px !important;
         margin: 0 !important;
         padding: 0 !important;
+        background: #000 !important;
       }
       html.${FLAG} body {
-        overflow: visible !important;
-        margin: 0 !important;
-        transform: translate(${-L}px, ${-T}px) !important;
-        transform-origin: 0 0 !important;
-        width: ${layoutW}px !important;
-        min-width: ${layoutW}px !important;
+        width: 100% !important;
+        height: 100% !important;
+        position: relative !important;
       }
-      /* Exit control lives in the visible W×H viewport (not transformed with body) */
       #${EXIT_ID} {
         position: fixed !important;
         top: 6px !important;
         right: 6px !important;
         z-index: 2147483647 !important;
-        border: 1px solid rgba(255,255,255,0.18) !important;
+        border: 1px solid rgba(255,255,255,0.2) !important;
         border-radius: 8px !important;
-        background: rgba(15,23,42,0.88) !important;
+        background: rgba(15,23,42,0.9) !important;
         color: #f8fafc !important;
         font: 700 11px/1 system-ui,sans-serif !important;
-        padding: 7px 9px !important;
+        padding: 7px 10px !important;
         cursor: pointer !important;
         pointer-events: auto !important;
-        box-shadow: 0 4px 16px rgba(0,0,0,0.35) !important;
-        transform: none !important;
-        opacity: 0.35 !important;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.4) !important;
+        opacity: 0.4 !important;
         transition: opacity 0.15s ease !important;
       }
       #${EXIT_ID}:hover {
@@ -125,42 +168,46 @@
       document.documentElement.appendChild(style);
     }
     style.textContent = css;
-
     document.documentElement.classList.add(FLAG);
+
     document.documentElement.style.setProperty("overflow", "hidden", "important");
-    document.documentElement.style.setProperty("width", layoutW + "px", "important");
-    document.documentElement.style.setProperty("min-width", layoutW + "px", "important");
-    document.documentElement.style.setProperty("height", layoutH + "px", "important");
+    body.style.setProperty("overflow", "hidden", "important");
+    body.style.setProperty("margin", "0", "important");
 
-    if (document.body) {
-      document.body.style.setProperty("overflow", "visible", "important");
-      document.body.style.setProperty("margin", "0", "important");
-      document.body.style.setProperty("transform", `translate(${-L}px, ${-T}px)`, "important");
-      document.body.style.setProperty("transform-origin", "0 0", "important");
-      document.body.style.setProperty("width", layoutW + "px", "important");
-      document.body.style.setProperty("min-width", layoutW + "px", "important");
-    }
-
-    // Prevent scroll from shifting the crop
     try {
       window.scrollTo(0, 0);
     } catch (_) {}
 
+    // Force a paint with frozen metrics
+    try {
+      void stage.offsetHeight;
+      window.dispatchEvent(new Event("resize")); // some apps need one; we block propagation to page... 
+      // actually our handler blocks it. Good.
+    } catch (_) {}
+
+    // Exit control on documentElement (outside stage transform)
     let exit = document.getElementById(EXIT_ID);
     if (!exit) {
       exit = document.createElement("button");
       exit.id = EXIT_ID;
       exit.type = "button";
       exit.textContent = "✕ Exit Focus";
-      exit.title = "Restore full page";
+      exit.title = "Return tab to Chrome";
       exit.addEventListener(
         "click",
         (e) => {
           e.preventDefault();
           e.stopPropagation();
-          chrome.runtime.sendMessage({ type: "stop-focus-mode" }).catch(() => {
-            restore(true);
-          });
+          e.stopImmediatePropagation();
+          chrome.runtime
+            .sendMessage({ type: "stop-focus-mode" })
+            .then((res) => {
+              if (!res || res.ok === false) {
+                // Fallback local restore if SW failed
+                restore(true);
+              }
+            })
+            .catch(() => restore(true));
         },
         true
       );
@@ -174,53 +221,73 @@
 
   window.__viewProxyFocusRestore = function restore(removeExit = true) {
     const state = window.__viewProxyFocusState;
-    document.documentElement.classList.remove(FLAG);
 
+    // Remove listeners / patches first
+    if (state?.resizeHandler) {
+      window.removeEventListener("resize", state.resizeHandler, true);
+      window.removeEventListener("orientationchange", state.resizeHandler, true);
+    }
+    if (state?.patched) {
+      for (const p of state.patched) {
+        try {
+          if (p.existing) {
+            Object.defineProperty(p.obj, p.key, p.existing);
+          } else {
+            delete p.obj[p.key];
+          }
+        } catch (_) {
+          try {
+            delete p.obj[p.key];
+          } catch (__) {}
+        }
+      }
+    }
+
+    document.documentElement.classList.remove(FLAG);
     document.getElementById(STYLE_ID)?.remove();
     if (removeExit) document.getElementById(EXIT_ID)?.remove();
 
+    // Unwrap stage
+    const stage = document.getElementById(STAGE_ID);
+    if (stage && state?.stageCreated) {
+      const parent = stage.parentNode;
+      if (parent) {
+        while (stage.firstChild) {
+          parent.insertBefore(stage.firstChild, stage);
+        }
+        stage.remove();
+      }
+    } else if (stage) {
+      stage.style.cssText = "";
+    }
+
+    document.documentElement.style.overflow = "";
+    document.documentElement.style.width = "";
+    document.documentElement.style.height = "";
+    document.documentElement.style.minWidth = "";
+    if (document.body) {
+      document.body.style.overflow = "";
+      document.body.style.margin = "";
+      document.body.style.width = "";
+      document.body.style.minWidth = "";
+      document.body.style.transform = "";
+      document.body.style.transformOrigin = "";
+    }
+
     if (state) {
-      if (state.metaViewportCreated) {
-        document.querySelector('meta[name="viewport"][data-viewproxy="1"]')?.remove();
-      } else if (state.metaViewport != null) {
-        const m = document.querySelector('meta[name="viewport"]');
-        if (m) m.setAttribute("content", state.metaViewport);
-      }
-
-      document.documentElement.style.overflow = state.htmlOverflow || "";
-      document.documentElement.style.width = state.htmlWidth || "";
-      document.documentElement.style.minWidth = state.htmlMinWidth || "";
-      document.documentElement.style.height = state.htmlHeight || "";
-      document.documentElement.style.maxHeight = state.htmlMaxHeight || "";
-
-      if (document.body) {
-        document.body.style.overflow = state.bodyOverflow || "";
-        document.body.style.transform = state.bodyTransform || "";
-        document.body.style.transformOrigin = state.bodyOrigin || "";
-        document.body.style.width = state.bodyWidth || "";
-        document.body.style.minWidth = state.bodyMinWidth || "";
-        document.body.style.margin = state.bodyMargin || "";
-        document.body.style.padding = state.bodyPadding || "";
-      }
       try {
         window.scrollTo(state.scrollX || 0, state.scrollY || 0);
       } catch (_) {}
-    } else {
-      document.documentElement.style.overflow = "";
-      document.documentElement.style.width = "";
-      document.documentElement.style.minWidth = "";
-      document.documentElement.style.height = "";
-      if (document.body) {
-        document.body.style.overflow = "";
-        document.body.style.transform = "";
-        document.body.style.transformOrigin = "";
-        document.body.style.width = "";
-        document.body.style.minWidth = "";
-      }
     }
 
     window.__viewProxyFocusState = null;
     window.__viewProxyFocusBox = null;
+
+    // Nudge layout back
+    try {
+      window.dispatchEvent(new Event("resize"));
+    } catch (_) {}
+
     return { ok: true };
   };
 
@@ -228,15 +295,25 @@
     return !!window.__viewProxyFocusState;
   };
 
-  /** Measure window chrome for true-size outer sizing */
   window.__viewProxyFocusMeasure = function measure() {
+    // Read REAL dimensions via visualViewport / documentElement before patches… 
+    // When patched, use outer from chrome.windows instead; still report patched for sizing math.
+    // For window chrome calculation we need REAL inner vs outer.
+    // Use a side channel: store real values on apply and update via outer-inner from screen.
     return {
-      innerW: window.innerWidth,
-      innerH: window.innerHeight,
+      // When frozen, use screen API as truth for outer, and compute chrome from last known
+      innerW: window.__viewProxyFocusRealInnerW || window.innerWidth,
+      innerH: window.__viewProxyFocusRealInnerH || window.innerHeight,
       outerW: window.outerWidth,
       outerH: window.outerHeight,
       dpr: window.devicePixelRatio || 1,
       box: window.__viewProxyFocusBox || null
     };
+  };
+
+  // Keep real inner sizes updated when not frozen (and stash before patch)
+  window.__viewProxyFocusCaptureRealSize = function () {
+    // Call BEFORE patching in apply — but apply already patches.
+    // Unpatched read: use documentElement.getBoundingClientRect of a probe
   };
 })();
