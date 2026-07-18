@@ -441,6 +441,48 @@ async function startFocusMode({ tabId, pixelBox, viewport }) {
       width: Math.max(100, Math.round(box.width + chromeW)),
       height: Math.max(80, Math.round(box.height + chromeH))
     });
+
+    // 5) Fluid fill: scale stage so box W×H fills the REAL client area.
+    //    Measure from ISOLATED world (unpatched) — MAIN freezes innerWidth.
+    await new Promise((r) => setTimeout(r, 80));
+    await applyAttractFill(tabId, box.width, box.height);
+
+    // One more chrome correction + fill (title bar can shift after first resize)
+    await new Promise((r) => setTimeout(r, 50));
+    try {
+      const m2 = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "ISOLATED",
+        func: () => ({
+          iw: window.innerWidth,
+          ih: window.innerHeight,
+          ow: window.outerWidth,
+          oh: window.outerHeight
+        })
+      });
+      const r2 = m2?.[0]?.result;
+      if (r2?.iw && r2?.ih) {
+        const cW = Math.max(0, Math.min(48, (r2.ow || 0) - r2.iw));
+        const cH = Math.max(24, Math.min(100, (r2.oh || 0) - r2.ih));
+        // If isolated still reports frozen size (same as layout), skip re-size
+        if (Math.abs(r2.iw - box.width) > 4 || Math.abs(r2.ih - box.height) > 4) {
+          // Real client differs from box — just fill to whatever client is
+          await applyAttractFill(tabId, box.width, box.height, r2.iw, r2.ih);
+        } else {
+          // Client matches box; ensure fill scale = 1 (or tiny chrome error)
+          await applyAttractFill(tabId, box.width, box.height, r2.iw, r2.ih);
+        }
+        // If client is way off box, re-assert outer size once
+        if (Math.abs(r2.iw - box.width) > 8 || Math.abs(r2.ih - box.height) > 8) {
+          await chrome.windows.update(win.id, {
+            width: Math.max(100, Math.round(box.width + cW)),
+            height: Math.max(80, Math.round(box.height + cH))
+          });
+          await new Promise((r) => setTimeout(r, 50));
+          await applyAttractFill(tabId, box.width, box.height);
+        }
+      }
+    } catch (_) {}
   }
 
   return {
@@ -449,6 +491,45 @@ async function startFocusMode({ tabId, pixelBox, viewport }) {
     h: box.height,
     windowId: session.focusWindowId
   };
+}
+
+/**
+ * Scale the attracted stage so the selected box fills the real window client area.
+ * Isolated world sees true innerWidth/Height; MAIN world is frozen for React.
+ */
+async function applyAttractFill(tabId, boxW, boxH, realW, realH) {
+  if (realW == null || realH == null) {
+    try {
+      const m = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "ISOLATED",
+        func: () => ({
+          // Prefer visualViewport if present (true layout viewport)
+          iw: window.visualViewport?.width || window.innerWidth,
+          ih: window.visualViewport?.height || window.innerHeight
+        })
+      });
+      realW = m?.[0]?.result?.iw;
+      realH = m?.[0]?.result?.ih;
+    } catch (_) {}
+  }
+  if (!realW || !realH) {
+    realW = boxW;
+    realH = boxH;
+  }
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: (rw, rh) => {
+      if (window.__viewProxyAttractor && window.__viewProxyAttractor.setFill) {
+        // fill = stretch box to exact client (fluid cover of the window)
+        return window.__viewProxyAttractor.setFill(rw, rh, "fill");
+      }
+      return { ok: false };
+    },
+    args: [realW, realH]
+  });
 }
 
 /**

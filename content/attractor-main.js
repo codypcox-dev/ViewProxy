@@ -1,15 +1,13 @@
 /**
- * ViewProxy Attractor — runs in the PAGE main world (not the extension isolated world).
- * That is the only place we can freeze window.innerWidth for React/Grok.
+ * ViewProxy Attractor — MAIN world (where React reads window.innerWidth).
  *
- * Attractor model:
- *  1) Freeze layout metrics to selection-time viewport
- *  2) Translate page so the yellow box sits at (0,0)
- *  3) Host window is resized to W×H → true-size live view
- *  4) Restore undoes freeze + moves tab back (background handles window)
+ * 1) Freeze layout metrics to selection-time viewport (no SPA reflow)
+ * 2) Translate so the yellow box sits at (0,0)
+ * 3) After the OS window is resized to ~box size, scale the stage so that
+ *    box W×H fluidly FILLS the real client area (true-size, no “zoom in” corner)
  */
 (function () {
-  if (window.__viewProxyAttractor && window.__viewProxyAttractor.version >= 1) {
+  if (window.__viewProxyAttractor && window.__viewProxyAttractor.version >= 2) {
     return;
   }
 
@@ -19,7 +17,7 @@
   const FLAG = "__viewproxy_attr";
 
   const api = {
-    version: 1,
+    version: 2,
     state: null,
 
     /**
@@ -43,6 +41,8 @@
         H,
         layoutW,
         layoutH,
+        fillScaleX: 1,
+        fillScaleY: 1,
         scrollX: window.scrollX,
         scrollY: window.scrollY,
         patches: [],
@@ -52,7 +52,6 @@
         metaCreated: false
       };
 
-      // ── Freeze metrics in THIS world (the page's React sees these) ──
       function patch(obj, key, value) {
         try {
           let desc = null;
@@ -70,6 +69,7 @@
         } catch (_) {}
       }
 
+      // Page JS (React) keeps thinking the viewport is the original size
       patch(window, "innerWidth", layoutW);
       patch(window, "innerHeight", layoutH);
       patch(window, "outerWidth", layoutW);
@@ -84,10 +84,10 @@
           patch(window.visualViewport, "height", layoutH);
           patch(window.visualViewport, "offsetLeft", 0);
           patch(window.visualViewport, "offsetTop", 0);
+          patch(window.visualViewport, "scale", 1);
         }
       } catch (_) {}
 
-      // Block resize from notifying frameworks
       state.resizeStop = function (e) {
         e.stopImmediatePropagation();
         e.preventDefault();
@@ -95,7 +95,6 @@
       window.addEventListener("resize", state.resizeStop, true);
       window.addEventListener("orientationchange", state.resizeStop, true);
 
-      // Viewport meta: discourage mobile reflow
       let meta = document.querySelector('meta[name="viewport"]');
       if (meta) {
         state.meta = meta.getAttribute("content");
@@ -113,7 +112,6 @@
         state.metaCreated = true;
       }
 
-      // ── Stage wrapper: translate box to origin ─────────────────────
       const body = document.body;
       if (!body) throw new Error("No body");
 
@@ -134,23 +132,25 @@
         state.stageCreated = true;
       }
 
-      stage.setAttribute(
-        "style",
-        [
+      // Rightmost transform applies first: translate box to origin, then scale to fill
+      function applyStageTransform(sx, sy) {
+        stage.style.cssText = [
           "display:block",
           "position:relative",
           "box-sizing:border-box",
-          "transform:translate(" + -L + "px," + -T + "px)",
+          // scale AFTER translate in matrix terms → write scale then translate in CSS
+          "transform:scale(" + sx + "," + sy + ") translate(" + -L + "px," + -T + "px)",
           "transform-origin:0 0",
           "width:" + layoutW + "px",
           "min-width:" + layoutW + "px",
           "margin:0",
           "padding:0",
           "will-change:transform"
-        ].join(";")
-      );
+        ].join(";");
+      }
+      state.applyStageTransform = applyStageTransform;
+      applyStageTransform(1, 1);
 
-      // Clip to the window; layout stays frozen via patched metrics
       let style = document.getElementById(STYLE_ID);
       if (!style) {
         style = document.createElement("style");
@@ -200,7 +200,6 @@
         window.scrollTo(0, 0);
       } catch (_) {}
 
-      // Exit → tell extension (isolated bridge listens for this message)
       let exit = document.getElementById(EXIT_ID);
       if (!exit) {
         exit = document.createElement("button");
@@ -224,6 +223,40 @@
       return { ok: true, box: { left: L, top: T, width: W, height: H }, layoutW, layoutH };
     },
 
+    /**
+     * After the OS window is resized, scale the selected box to FILL the real client area.
+     * realW/realH must be measured from the ISOLATED world (unpatched) or windows API.
+     * mode: "fill" stretch | "contain" letterbox | "cover" crop-to-fill
+     */
+    setFill(realW, realH, mode) {
+      const state = api.state;
+      if (!state || !state.applyStageTransform) return { ok: false };
+
+      realW = Math.max(1, Number(realW) || 1);
+      realH = Math.max(1, Number(realH) || 1);
+      const W = state.W;
+      const H = state.H;
+      mode = mode || "fill";
+
+      let sx = realW / W;
+      let sy = realH / H;
+      if (mode === "contain") {
+        const s = Math.min(sx, sy);
+        sx = s;
+        sy = s;
+      } else if (mode === "cover") {
+        const s = Math.max(sx, sy);
+        sx = s;
+        sy = s;
+      }
+      // "fill" keeps independent sx, sy — stretches to exact client
+
+      state.fillScaleX = sx;
+      state.fillScaleY = sy;
+      state.applyStageTransform(sx, sy);
+      return { ok: true, sx, sy, realW, realH, W, H };
+    },
+
     restore(opts) {
       const keepExit = opts && opts.keepExit;
       const state = api.state;
@@ -239,7 +272,6 @@
         window.removeEventListener("orientationchange", state.resizeStop, true);
       }
 
-      // Unpatch metrics
       for (const p of state.patches) {
         try {
           if (p.desc) Object.defineProperty(p.obj, p.key, p.desc);
@@ -251,7 +283,6 @@
         }
       }
 
-      // Viewport meta
       if (state.metaCreated) {
         document.querySelector('meta[name="viewport"][data-viewproxy="1"]')?.remove();
       } else if (state.meta != null) {
@@ -268,7 +299,6 @@
         document.body.style.margin = "";
       }
 
-      // Unwrap stage
       const stage = document.getElementById(STAGE_ID);
       if (stage && state.stageCreated) {
         const parent = stage.parentNode;
@@ -285,12 +315,9 @@
       } catch (_) {}
 
       api.state = null;
-
-      // Let the page reflow for real dimensions now
       try {
         window.dispatchEvent(new Event("resize"));
       } catch (_) {}
-
       return { ok: true };
     },
 

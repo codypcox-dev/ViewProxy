@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ViewProxy",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Watch a region as pixels, or Attract: reshape the live tab window to that box. 100% local.",
   "icons": {
     "16": "icons/icon16.png",
