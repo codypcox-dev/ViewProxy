@@ -306,10 +306,37 @@ chrome.windows.onRemoved.addListener((windowId) => {
 });
 
 // Crop-resize: when user drags window edges, update content origin so TOP consumes like BOTTOM
+// Serialized so rapid drag events cannot race and shove the crop off-center.
+let attractBoundsChain = Promise.resolve();
 if (chrome.windows.onBoundsChanged) {
   chrome.windows.onBoundsChanged.addListener((win) => {
-    handleAttractBoundsChanged(win).catch(() => {});
+    attractBoundsChain = attractBoundsChain
+      .then(() => handleAttractBoundsChanged(win))
+      .catch(() => {});
   });
+}
+
+async function measureAttractClient(tabId) {
+  try {
+    const m = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "ISOLATED",
+      func: () => {
+        const vv = window.visualViewport;
+        return {
+          iw: Math.round(
+            vv?.width || document.documentElement?.clientWidth || window.innerWidth || 0
+          ),
+          ih: Math.round(
+            vv?.height || document.documentElement?.clientHeight || window.innerHeight || 0
+          )
+        };
+      }
+    });
+    return m?.[0]?.result || null;
+  } catch (_) {
+    return null;
+  }
 }
 
 async function handleAttractBoundsChanged(win) {
@@ -317,7 +344,7 @@ async function handleAttractBoundsChanged(win) {
   if (!session || win.id !== session.focusWindowId) return;
   if (session.ignoreBounds) return;
 
-  const prev = session.lastBounds;
+  const prevBounds = session.lastBounds;
   const nextBounds = {
     left: win.left,
     top: win.top,
@@ -325,53 +352,61 @@ async function handleAttractBoundsChanged(win) {
     height: win.height
   };
 
-  if (session.cropResize === false) {
-    // Still fluid-fill to new client size (width-flush + vertical center)
-    session.lastBounds = nextBounds;
-    await applyAttractFill(session.tabId, session.box.width, session.box.height);
-    return;
-  }
+  const client = (await measureAttractClient(session.tabId)) || session.lastClient || null;
+  const prevClient = session.lastClient;
 
-  if (!prev || prev.left == null) {
-    session.lastBounds = nextBounds;
-    return;
-  }
-
-  const dLeft = (win.left ?? 0) - (prev.left ?? 0);
-  const dTop = (win.top ?? 0) - (prev.top ?? 0);
-  const dWidth = (win.width ?? 0) - (prev.width ?? 0);
-  const dHeight = (win.height ?? 0) - (prev.height ?? 0);
-
+  // Always bookkeep latest geometry first
   session.lastBounds = nextBounds;
+  if (client) session.lastClient = client;
 
-  // Ignore no-ops / pure jitter
-  if (dLeft === 0 && dTop === 0 && dWidth === 0 && dHeight === 0) return;
+  if (!prevBounds || prevBounds.left == null) {
+    if (client) await applyAttractFill(session.tabId, session.box.width, session.box.height, client.iw, client.ih);
+    return;
+  }
 
-  // Pure move (title-bar drag): no crop, no reflow needed
+  const dLeft = (win.left ?? 0) - (prevBounds.left ?? 0);
+  const dTop = (win.top ?? 0) - (prevBounds.top ?? 0);
+  const dWidth = (win.width ?? 0) - (prevBounds.width ?? 0);
+  const dHeight = (win.height ?? 0) - (prevBounds.height ?? 0);
+
+  // Pure move — keep crop + center as-is
   if (dWidth === 0 && dHeight === 0) return;
 
-  // Update crop origin/size in MAIN world
-  //   L/R size change → scale only (L/W fixed)
-  //   T/B size change → crop T/H
-  try {
-    const res = await chrome.scripting.executeScript({
-      target: { tabId: session.tabId },
-      world: "MAIN",
-      func: (dl, dt, dw, dh) => {
-        if (!window.__viewProxyAttractor?.applyBoundsDelta) return { ok: false };
-        return window.__viewProxyAttractor.applyBoundsDelta(dl, dt, dw, dh);
-      },
-      args: [dLeft, dTop, dWidth, dHeight]
-    });
-    const box = res?.[0]?.result?.box;
-    if (box) {
-      session.box = box;
-      await chrome.storage.session.set({ viewproxyFocusSession: session });
-    }
-  } catch (_) {}
+  // Crop T/B using PAGE pixels. Convert via previous client scale so one
+  // window-pixel of drag maps correctly after zoom (not 1:1 with page px).
+  if (session.cropResize !== false && prevClient && client && Math.abs(client.ih - prevClient.ih) >= 1) {
+    const prevScale = Math.max(0.0001, prevClient.iw / Math.max(1, session.box.width));
+    const dTpage = dTop / prevScale;
+    const dHpage = (client.ih - prevClient.ih) / prevScale;
+    try {
+      const res = await chrome.scripting.executeScript({
+        target: { tabId: session.tabId },
+        world: "MAIN",
+        func: (dt, dh) => {
+          if (window.__viewProxyAttractor?.applyCropPageDelta) {
+            return window.__viewProxyAttractor.applyCropPageDelta(dt, dh);
+          }
+          if (window.__viewProxyAttractor?.applyBoundsDelta) {
+            return window.__viewProxyAttractor.applyBoundsDelta(0, dt, 0, dh);
+          }
+          return { ok: false };
+        },
+        args: [dTpage, dHpage]
+      });
+      const box = res?.[0]?.result?.box;
+      if (box) {
+        session.box = box;
+        await chrome.storage.session.set({ viewproxyFocusSession: session });
+      }
+    } catch (_) {}
+  }
 
-  // Always re-fill: width-flush L/R + vertical center for new client size
-  await applyAttractFill(session.tabId, session.box.width, session.box.height);
+  // Universal re-center: crop center → viewport center, width-flush
+  if (client) {
+    await applyAttractFill(session.tabId, session.box.width, session.box.height, client.iw, client.ih);
+  } else {
+    await applyAttractFill(session.tabId, session.box.width, session.box.height);
+  }
 }
 
 async function stopAll(tabId) {
@@ -586,7 +621,7 @@ async function startFocusMode({ tabId, pixelBox, viewport }) {
       }
     } catch (_) {}
 
-    // Seed lastBounds AFTER programmatic sizing so user drags are relative to final box
+    // Seed lastBounds + client AFTER programmatic sizing so user drags are relative to final box
     try {
       const finalWin = await chrome.windows.get(win.id);
       session.lastBounds = {
@@ -597,6 +632,11 @@ async function startFocusMode({ tabId, pixelBox, viewport }) {
       };
     } catch (_) {
       session.lastBounds = null;
+    }
+    try {
+      session.lastClient = await measureAttractClient(tabId);
+    } catch (_) {
+      session.lastClient = null;
     }
     session.ignoreBounds = false;
     session.cropResize = true;
@@ -619,29 +659,20 @@ async function startFocusMode({ tabId, pixelBox, viewport }) {
  */
 async function applyAttractFill(tabId, boxW, boxH, realW, realH) {
   if (realW == null || realH == null) {
-    try {
-      const m = await chrome.scripting.executeScript({
-        target: { tabId },
-        world: "ISOLATED",
-        func: () => {
-          // True client viewport (MAIN world freezes these for the page)
-          const vv = window.visualViewport;
-          const iw = Math.round(
-            vv?.width || document.documentElement?.clientWidth || window.innerWidth || 0
-          );
-          const ih = Math.round(
-            vv?.height || document.documentElement?.clientHeight || window.innerHeight || 0
-          );
-          return { iw, ih };
-        }
-      });
-      realW = m?.[0]?.result?.iw;
-      realH = m?.[0]?.result?.ih;
-    } catch (_) {}
+    const c = await measureAttractClient(tabId);
+    if (c) {
+      realW = c.iw;
+      realH = c.ih;
+    }
   }
   if (!realW || !realH) {
     realW = boxW;
     realH = boxH;
+  }
+
+  // Keep session client cache warm for next bounds delta conversion
+  if (focusSession && focusSession.tabId === tabId) {
+    focusSession.lastClient = { iw: realW, ih: realH };
   }
 
   await chrome.scripting.executeScript({
@@ -649,7 +680,7 @@ async function applyAttractFill(tabId, boxW, boxH, realW, realH) {
     world: "MAIN",
     func: (rw, rh) => {
       if (window.__viewProxyAttractor && window.__viewProxyAttractor.setFill) {
-        // Width-flush + vertical center (see attractor-main setFill)
+        // Universal center: crop center → viewport center, width-flush
         return window.__viewProxyAttractor.setFill(rw, rh);
       }
       return { ok: false };

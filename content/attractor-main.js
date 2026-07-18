@@ -1,12 +1,17 @@
 /**
  * ViewProxy Attractor — MAIN world
  *
- * Layout rules (user spec):
- *  - Content NEVER leaves left/right of the viewport (always width-flush)
- *  - Content stays fluidly centered on the vertical axis
- *  - Left/right window edges → scale (zoom) toward center; crop L/W unchanged
- *  - Top/bottom window edges → crop (consume/reveal); T/H change
- *  - Pure window move (no size change) → no crop change
+ * Universal viewport centering (one rule):
+ *   scale = realW / cropW          (width-flush: never leave L/R)
+ *   crop center  →  viewport center
+ *   matrix(s, 0, 0, s, tx, ty) with
+ *     tx = realW/2 - s * (L + W/2)
+ *     ty = realH/2 - s * (T + H/2)
+ *
+ * Resize:
+ *   L/R edges → scale only (L/W fixed); center holds
+ *   T/B edges → crop T/H in page space; then re-center
+ *   pure move → no-op
  */
 (function () {
   const STYLE_ID = "__viewproxy_attr_style";
@@ -14,9 +19,12 @@
   const EXIT_ID = "__viewproxy_attr_exit";
   const FLAG = "__viewproxy_attr";
 
+  // Preserve live session if script is re-injected mid-attract
+  const prevState = window.__viewProxyAttractor && window.__viewProxyAttractor.state;
+
   const api = {
-    version: 6,
-    state: null,
+    version: 7,
+    state: prevState || null,
 
     apply(box, viewport) {
       if (api.state) api.restore({ keepExit: true });
@@ -35,10 +43,7 @@
         H,
         layoutW,
         layoutH,
-        fillScaleX: 1,
-        fillScaleY: 1,
-        centerX: 0,
-        centerY: 0,
+        scale: 1,
         lastRealW: W,
         lastRealH: H,
         cropResize: true,
@@ -69,7 +74,7 @@
         } catch (_) {}
       }
 
-      // Freeze layout metrics so React/layout see the original page size
+      // Freeze layout metrics so React/layout still see the original page size
       patch(window, "innerWidth", layoutW);
       patch(window, "innerHeight", layoutH);
       patch(window, "outerWidth", layoutW);
@@ -95,7 +100,6 @@
       window.addEventListener("resize", state.resizeStop, true);
       window.addEventListener("orientationchange", state.resizeStop, true);
 
-      // Keep document pinned at 0,0 so stage origin is stable
       state.scrollLock = function () {
         try {
           if (window.scrollX !== 0 || window.scrollY !== 0) window.scrollTo(0, 0);
@@ -139,18 +143,34 @@
         body.appendChild(stage);
         state.stageCreated = true;
       }
+      state.stageEl = stage;
 
       /**
-       * Matrix (rightmost first): crop→origin, uniform scale, then place.
-       * Width-flush: sx = realW/W, cx = 0  → left at 0, right at realW.
-       * Vertical center: cy = (realH - H*sy) / 2  → crop center at realH/2.
+       * ONE paint path. Always maps crop center → viewport center.
+       * Width-flush: s = realW/W so crop left→0 and crop right→realW.
        */
-      function applyStageTransform(sx, sy, cx, cy) {
+      function paint() {
         const s = api.state || state;
-        cx = cx != null ? cx : 0;
-        cy = cy != null ? cy : s.centerY || 0;
-        // Fixed to viewport so body flow / reflow cannot drift the stage
-        stage.style.cssText = [
+        const stageEl = s.stageEl || document.getElementById(STAGE_ID);
+        if (!stageEl) return;
+
+        const realW = Math.max(1, s.lastRealW || s.W);
+        const realH = Math.max(1, s.lastRealH || s.H);
+        const W = Math.max(1, s.W);
+        const H = Math.max(1, s.H);
+        const scale = realW / W;
+
+        const cropCx = s.L + W / 2;
+        const cropCy = s.T + H / 2;
+        const viewCx = realW / 2;
+        const viewCy = realH / 2;
+        const tx = viewCx - scale * cropCx;
+        const ty = viewCy - scale * cropCy;
+
+        s.scale = scale;
+
+        // Single matrix — no stacked translate/scale origin games
+        stageEl.style.cssText = [
           "display:block",
           "position:fixed",
           "left:0",
@@ -161,32 +181,18 @@
           "margin:0",
           "padding:0",
           "border:0",
-          "transform:translate3d(" +
-            cx +
-            "px," +
-            cy +
-            "px,0) scale(" +
-            sx +
-            "," +
-            sy +
-            ") translate3d(" +
-            -s.L +
-            "px," +
-            -s.T +
-            "px,0)",
-          "transform-origin:0 0",
           "width:" + s.layoutW + "px",
-          "min-width:" + s.layoutW + "px",
           "height:" + s.layoutH + "px",
-          "min-height:" + s.layoutH + "px",
+          "transform:matrix(" + scale + ",0,0," + scale + "," + tx + "," + ty + ")",
+          "transform-origin:0 0",
           "overflow:visible",
           "will-change:transform",
           "z-index:0",
           "pointer-events:auto"
         ].join(";");
       }
-      state.applyStageTransform = applyStageTransform;
-      applyStageTransform(1, 1, 0, 0);
+      state.paint = paint;
+      paint();
 
       let style = document.getElementById(STYLE_ID);
       if (!style) {
@@ -289,7 +295,10 @@
           const t = e.target;
           const act =
             (t && t.getAttribute && t.getAttribute("data-act")) ||
-            (t && t.closest && t.closest("[data-act]") && t.closest("[data-act]").getAttribute("data-act"));
+            (t &&
+              t.closest &&
+              t.closest("[data-act]") &&
+              t.closest("[data-act]").getAttribute("data-act"));
           if (act === "exit") {
             e.preventDefault();
             e.stopPropagation();
@@ -328,56 +337,77 @@
     },
 
     /**
-     * Width-flush + vertical center (always):
-     *   sx = sy = realW / W     → left edge at 0, right at realW (never leave L/R)
-     *   cx = 0
-     *   cy = (realH - H*sy) / 2 → crop center sits on vertical midline
-     *
-     * Tall windows: black bars above/below, content centered.
-     * Short windows: top/bottom of scaled crop crop out of view, still centered.
+     * Re-bind the stage to the true client viewport.
+     * Always centers crop on viewport; always width-flush.
      */
     setFill(realW, realH) {
       const state = api.state;
-      if (!state || !state.applyStageTransform) return { ok: false };
+      if (!state || !state.paint) return { ok: false };
 
-      realW = Math.max(1, Number(realW) || 1);
-      realH = Math.max(1, Number(realH) || 1);
-      const W = Math.max(1, state.W);
-      const H = Math.max(1, state.H);
+      state.lastRealW = Math.max(1, Number(realW) || 1);
+      state.lastRealH = Math.max(1, Number(realH) || 1);
+      state.paint();
 
-      // Never leave left/right: uniform scale driven by WIDTH only
-      const s = realW / W;
-      const sx = s;
-      const sy = s;
-      const cx = 0;
-      // Fluid vertical center (can be negative → T/B crop out of view)
-      const cy = Math.round((realH - H * sy) / 2);
-
-      state.fillScaleX = sx;
-      state.fillScaleY = sy;
-      state.centerX = cx;
-      state.centerY = cy;
-      state.lastRealW = realW;
-      state.lastRealH = realH;
-      state.applyStageTransform(sx, sy, cx, cy);
-      return { ok: true, sx, sy, cx, cy, realW, realH, W, H, L: state.L, T: state.T };
+      const scale = state.scale;
+      return {
+        ok: true,
+        scale,
+        realW: state.lastRealW,
+        realH: state.lastRealH,
+        W: state.W,
+        H: state.H,
+        L: state.L,
+        T: state.T,
+        // debug: where crop center lands
+        cropCx: state.L + state.W / 2,
+        cropCy: state.T + state.H / 2,
+        viewCx: state.lastRealW / 2,
+        viewCy: state.lastRealH / 2
+      };
     },
 
     /**
-     * Window bounds deltas (chrome.windows DIP).
-     *
-     * - Pure move (dWidth=dHeight=0): no-op on crop
-     * - Left/right size change: L/W fixed → setFill scales toward center
-     * - Top/bottom size change: crop T/H (top edge consumes top, bottom consumes bottom)
-     * - Diagonal: vertical crop + horizontal scale (never crop L/W)
+     * Apply crop delta already converted to PAGE pixels (not window DIPs).
+     * Horizontal crop is never applied (L/W stay fixed).
+     */
+    applyCropPageDelta(dT, dH) {
+      const state = api.state;
+      if (!state) return { ok: false };
+      if (!state.cropResize) {
+        return { ok: true, cropResize: false, box: api.getBox() };
+      }
+      if (!dT && !dH) {
+        return { ok: true, cropResize: true, box: api.getBox(), scaleOnly: true };
+      }
+
+      let T = state.T + (Number(dT) || 0);
+      let H = state.H + (Number(dH) || 0);
+
+      const MIN = 40;
+      if (H < MIN) {
+        if ((Number(dT) || 0) > 0) T -= MIN - H;
+        H = MIN;
+      }
+      T = Math.max(0, Math.min(T, state.layoutH - MIN));
+      H = Math.max(MIN, Math.min(H, state.layoutH - T));
+
+      state.T = Math.round(T);
+      state.H = Math.round(H);
+      // L, W never change
+      state.paint();
+
+      return { ok: true, cropResize: true, box: api.getBox(), scaleOnly: false };
+    },
+
+    /**
+     * Legacy window-DIP path (kept for safety). Prefer applyCropPageDelta.
+     * Horizontal size changes → scale only. Vertical → page crop via /scale.
      */
     applyBoundsDelta(dLeft, dTop, dWidth, dHeight) {
       const state = api.state;
       if (!state) return { ok: false };
 
-      const sizeChanged = dWidth !== 0 || dHeight !== 0;
-      if (!sizeChanged) {
-        // Dragging the window title bar — do not touch crop or scale
+      if (dWidth === 0 && dHeight === 0) {
         return {
           ok: true,
           cropResize: !!state.cropResize,
@@ -387,47 +417,13 @@
         };
       }
 
-      if (!state.cropResize) {
-        return { ok: true, cropResize: false, box: api.getBox(), scaleOnly: true };
+      if (!state.cropResize || dHeight === 0) {
+        return { ok: true, cropResize: !!state.cropResize, box: api.getBox(), scaleOnly: true };
       }
 
-      // Horizontal-only resize: scale via setFill only
-      if (dHeight === 0) {
-        return { ok: true, cropResize: true, box: api.getBox(), scaleOnly: true };
-      }
-
-      // Vertical (or diagonal) size change: crop top/bottom only
-      // dTop moves the top edge of the window → consume/reveal top content
-      // dHeight is the net height change (bottom edge alone → dTop=0)
-      let T = state.T + dTop;
-      let H = state.H + dHeight;
-
-      const MIN = 40;
-      if (H < MIN) {
-        if (dTop > 0) T -= MIN - H;
-        H = MIN;
-      }
-      T = Math.max(0, Math.min(T, state.layoutH - MIN));
-      H = Math.max(MIN, Math.min(H, state.layoutH - T));
-
-      state.T = Math.round(T);
-      state.H = Math.round(H);
-      // L, W never change — left/right always scale, never crop
-
-      // Provisional transform; setFill immediately after will re-center
-      const sx = state.fillScaleX || 1;
-      const sy = state.fillScaleY || 1;
-      const realH = state.lastRealH || H * sy;
-      const cy = Math.round((realH - state.H * sy) / 2);
-      state.centerY = cy;
-      state.applyStageTransform(sx, sy, 0, cy);
-
-      return {
-        ok: true,
-        cropResize: true,
-        box: api.getBox(),
-        scaleOnly: false
-      };
+      // Convert outer DIPs → page pixels using current scale
+      const s = Math.max(0.0001, state.scale || 1);
+      return api.applyCropPageDelta(dTop / s, dHeight / s);
     },
 
     setCropResize(enabled) {
