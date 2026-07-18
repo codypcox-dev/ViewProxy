@@ -320,7 +320,7 @@
             frozen.width +
             "×" +
             frozen.height +
-            " px · live window · Exit Focus returns tab to Chrome"
+            " px · drag edges to crop · Exit returns tab"
         );
         // No capture loop — the tab window IS the view
       } catch (err) {

@@ -1,29 +1,23 @@
 /**
- * ViewProxy Attractor — MAIN world (where React reads window.innerWidth).
+ * ViewProxy Attractor — MAIN world
  *
- * 1) Freeze layout metrics to selection-time viewport (no SPA reflow)
- * 2) Translate so the yellow box sits at (0,0)
- * 3) After the OS window is resized to ~box size, scale the stage so that
- *    box W×H fluidly FILLS the real client area (true-size, no “zoom in” corner)
+ * - Freeze SPA viewport metrics (React sees original layout size)
+ * - Translate selected box to (0,0)
+ * - Scale box to fill real client area
+ * - Crop-resize: window edge drags update L/T/W/H so TOP behaves like BOTTOM
+ *   (edges "consume" content instead of pushing it)
  */
 (function () {
-  if (window.__viewProxyAttractor && window.__viewProxyAttractor.version >= 2) {
-    return;
-  }
-
+  // Always reinstall API (versioned) so extension reloads apply
   const STYLE_ID = "__viewproxy_attr_style";
   const STAGE_ID = "__viewproxy_attr_stage";
   const EXIT_ID = "__viewproxy_attr_exit";
   const FLAG = "__viewproxy_attr";
 
   const api = {
-    version: 2,
+    version: 3,
     state: null,
 
-    /**
-     * @param {{left:number,top:number,width:number,height:number}} box
-     * @param {{w:number,h:number}} viewport
-     */
     apply(box, viewport) {
       if (api.state) api.restore({ keepExit: true });
 
@@ -43,6 +37,7 @@
         layoutH,
         fillScaleX: 1,
         fillScaleY: 1,
+        cropResize: true, // default: edges act as crop tools
         scrollX: window.scrollX,
         scrollY: window.scrollY,
         patches: [],
@@ -69,7 +64,6 @@
         } catch (_) {}
       }
 
-      // Page JS (React) keeps thinking the viewport is the original size
       patch(window, "innerWidth", layoutW);
       patch(window, "innerHeight", layoutH);
       patch(window, "outerWidth", layoutW);
@@ -88,6 +82,7 @@
         }
       } catch (_) {}
 
+      // Swallow resize so SPA doesn't reflow — crop-resize is handled by the extension
       state.resizeStop = function (e) {
         e.stopImmediatePropagation();
         e.preventDefault();
@@ -132,17 +127,17 @@
         state.stageCreated = true;
       }
 
-      // Rightmost transform applies first: translate box to origin, then scale to fill
       function applyStageTransform(sx, sy) {
+        const s = api.state || state;
+        // CSS: rightmost applied first → translate to origin, then scale to fill client
         stage.style.cssText = [
           "display:block",
           "position:relative",
           "box-sizing:border-box",
-          // scale AFTER translate in matrix terms → write scale then translate in CSS
-          "transform:scale(" + sx + "," + sy + ") translate(" + -L + "px," + -T + "px)",
+          "transform:scale(" + sx + "," + sy + ") translate(" + -s.L + "px," + -s.T + "px)",
           "transform-origin:0 0",
-          "width:" + layoutW + "px",
-          "min-width:" + layoutW + "px",
+          "width:" + s.layoutW + "px",
+          "min-width:" + s.layoutW + "px",
           "margin:0",
           "padding:0",
           "will-change:transform"
@@ -181,13 +176,20 @@
           font: 700 11px/1 system-ui,sans-serif !important;
           padding: 7px 10px !important;
           cursor: pointer !important;
-          opacity: 0.4 !important;
+          opacity: 0.35 !important;
           transition: opacity .15s ease !important;
           pointer-events: auto !important;
         }
         #${EXIT_ID}:hover {
           opacity: 1 !important;
           background: rgba(127,29,29,.95) !important;
+        }
+        #${EXIT_ID} .vp-toggle {
+          display: block;
+          margin-top: 6px;
+          font: 600 10px/1.2 system-ui,sans-serif;
+          opacity: 0.9;
+          white-space: nowrap;
         }
       `;
 
@@ -202,17 +204,34 @@
 
       let exit = document.getElementById(EXIT_ID);
       if (!exit) {
-        exit = document.createElement("button");
+        exit = document.createElement("div");
         exit.id = EXIT_ID;
-        exit.type = "button";
-        exit.textContent = "✕ Exit Focus";
-        exit.title = "Return tab to Chrome";
+        exit.innerHTML =
+          '<button type="button" data-act="exit" style="all:unset;cursor:pointer;display:block;width:100%">✕ Exit Focus</button>' +
+          '<label class="vp-toggle"><input type="checkbox" data-act="crop" checked /> Crop edges</label>';
         exit.addEventListener(
           "click",
           (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            window.postMessage({ source: "viewproxy", type: "exit-focus" }, "*");
+            const act = e.target && e.target.getAttribute && e.target.getAttribute("data-act");
+            if (act === "exit" || e.target.closest?.('[data-act="exit"]')) {
+              e.preventDefault();
+              e.stopPropagation();
+              window.postMessage({ source: "viewproxy", type: "exit-focus" }, "*");
+            }
+          },
+          true
+        );
+        exit.addEventListener(
+          "change",
+          (e) => {
+            const t = e.target;
+            if (t && t.getAttribute && t.getAttribute("data-act") === "crop") {
+              if (api.state) api.state.cropResize = !!t.checked;
+              window.postMessage(
+                { source: "viewproxy", type: "crop-resize-toggle", enabled: !!t.checked },
+                "*"
+              );
+            }
           },
           true
         );
@@ -220,22 +239,23 @@
       }
 
       api.state = state;
-      return { ok: true, box: { left: L, top: T, width: W, height: H }, layoutW, layoutH };
+      return {
+        ok: true,
+        box: { left: L, top: T, width: W, height: H },
+        layoutW,
+        layoutH,
+        cropResize: true
+      };
     },
 
-    /**
-     * After the OS window is resized, scale the selected box to FILL the real client area.
-     * realW/realH must be measured from the ISOLATED world (unpatched) or windows API.
-     * mode: "fill" stretch | "contain" letterbox | "cover" crop-to-fill
-     */
     setFill(realW, realH, mode) {
       const state = api.state;
       if (!state || !state.applyStageTransform) return { ok: false };
 
       realW = Math.max(1, Number(realW) || 1);
       realH = Math.max(1, Number(realH) || 1);
-      const W = state.W;
-      const H = state.H;
+      const W = Math.max(1, state.W);
+      const H = Math.max(1, state.H);
       mode = mode || "fill";
 
       let sx = realW / W;
@@ -249,12 +269,96 @@
         sx = s;
         sy = s;
       }
-      // "fill" keeps independent sx, sy — stretches to exact client
 
       state.fillScaleX = sx;
       state.fillScaleY = sy;
       state.applyStageTransform(sx, sy);
-      return { ok: true, sx, sy, realW, realH, W, H };
+      return { ok: true, sx, sy, realW, realH, W, H, L: state.L, T: state.T };
+    },
+
+    /**
+     * Crop-resize from window bounds deltas (CSS/DIP pixels from chrome.windows).
+     *
+     * Windows default: top-left of client is content origin.
+     * Dragging TOP down moves the window and keeps content top-anchored → "pushes" content.
+     * We instead treat every edge as a crop edge:
+     *   dLeft/dTop shift the content origin (L/T)
+     *   dWidth/dHeight change visible size (W/H)
+     *
+     * So top-down ≡ consume top (like bottom-up consumes bottom).
+     */
+    applyBoundsDelta(dLeft, dTop, dWidth, dHeight) {
+      const state = api.state;
+      if (!state) return { ok: false };
+
+      if (!state.cropResize) {
+        // Normal Windows behavior: only size changes; origin stays (top-left anchor)
+        // W/H track client via setFill only
+        return { ok: true, cropResize: false, box: api.getBox() };
+      }
+
+      // Expand/shrink visible region in layout coordinates (1 DIP ≈ 1 CSS px)
+      let L = state.L + dLeft;
+      let T = state.T + dTop;
+      let W = state.W + dWidth;
+      let H = state.H + dHeight;
+
+      // Minimum crop size
+      const MIN = 40;
+      if (W < MIN) {
+        // If shrinking from left, push L back
+        if (dLeft > 0) L -= MIN - W;
+        W = MIN;
+      }
+      if (H < MIN) {
+        if (dTop > 0) T -= MIN - H;
+        H = MIN;
+      }
+
+      // Clamp to layout
+      L = Math.max(0, Math.min(L, state.layoutW - MIN));
+      T = Math.max(0, Math.min(T, state.layoutH - MIN));
+      W = Math.max(MIN, Math.min(W, state.layoutW - L));
+      H = Math.max(MIN, Math.min(H, state.layoutH - T));
+
+      state.L = Math.round(L);
+      state.T = Math.round(T);
+      state.W = Math.round(W);
+      state.H = Math.round(H);
+
+      // Re-apply transform with current fill scale
+      state.applyStageTransform(state.fillScaleX || 1, state.fillScaleY || 1);
+
+      return {
+        ok: true,
+        cropResize: true,
+        box: api.getBox()
+      };
+    },
+
+    setCropResize(enabled) {
+      if (!api.state) return { ok: false };
+      api.state.cropResize = !!enabled;
+      return { ok: true, cropResize: api.state.cropResize };
+    },
+
+    getBox() {
+      const s = api.state;
+      if (!s) return null;
+      return { left: s.L, top: s.T, width: s.W, height: s.H };
+    },
+
+    getState() {
+      const s = api.state;
+      if (!s) return null;
+      return {
+        box: api.getBox(),
+        layoutW: s.layoutW,
+        layoutH: s.layoutH,
+        cropResize: s.cropResize,
+        fillScaleX: s.fillScaleX,
+        fillScaleY: s.fillScaleY
+      };
     },
 
     restore(opts) {

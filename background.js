@@ -29,7 +29,10 @@ let panelWindowId = null;
  *   originalHadOtherTabs: boolean,
  *   focusWindowId: number|null,
  *   box: {left:number,top:number,width:number,height:number},
- *   viewport: {w:number,h:number}
+ *   viewport: {w:number,h:number},
+ *   lastBounds: {left:number,top:number,width:number,height:number}|null,
+ *   cropResize: boolean,
+ *   ignoreBounds: boolean
  * }|null}
  */
 let focusSession = null;
@@ -192,6 +195,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (type === "crop-resize-toggle") {
+    if (focusSession) {
+      focusSession.cropResize = message.enabled !== false;
+      chrome.storage.session.set({ viewproxyFocusSession: focusSession }).catch(() => {});
+    }
+    chrome.scripting
+      .executeScript({
+        target: { tabId: focusSession?.tabId },
+        world: "MAIN",
+        func: (en) => {
+          if (window.__viewProxyAttractor?.setCropResize) {
+            return window.__viewProxyAttractor.setCropResize(en);
+          }
+          return { ok: false };
+        },
+        args: [message.enabled !== false]
+      })
+      .catch(() => {});
+    sendResponse({ ok: true, cropResize: focusSession?.cropResize !== false });
+    return false;
+  }
+
   if (type === "capture-visible-tab") {
     (async () => {
       try {
@@ -264,6 +289,68 @@ chrome.windows.onRemoved.addListener((windowId) => {
     stopFocusMode().catch(() => {});
   }
 });
+
+// Crop-resize: when user drags window edges, update content origin so TOP consumes like BOTTOM
+if (chrome.windows.onBoundsChanged) {
+  chrome.windows.onBoundsChanged.addListener((win) => {
+    handleAttractBoundsChanged(win).catch(() => {});
+  });
+}
+
+async function handleAttractBoundsChanged(win) {
+  const session = focusSession;
+  if (!session || win.id !== session.focusWindowId) return;
+  if (session.ignoreBounds) return;
+  if (session.cropResize === false) {
+    // Still fluid-fill to new client size (normal Windows top-left anchor)
+    await applyAttractFill(session.tabId, session.box.width, session.box.height);
+    session.lastBounds = {
+      left: win.left,
+      top: win.top,
+      width: win.width,
+      height: win.height
+    };
+    return;
+  }
+
+  const prev = session.lastBounds;
+  session.lastBounds = {
+    left: win.left,
+    top: win.top,
+    width: win.width,
+    height: win.height
+  };
+  if (!prev || prev.left == null) return;
+
+  const dLeft = (win.left ?? 0) - (prev.left ?? 0);
+  const dTop = (win.top ?? 0) - (prev.top ?? 0);
+  const dWidth = (win.width ?? 0) - (prev.width ?? 0);
+  const dHeight = (win.height ?? 0) - (prev.height ?? 0);
+
+  // Ignore no-ops / tiny jitter
+  if (dLeft === 0 && dTop === 0 && dWidth === 0 && dHeight === 0) return;
+
+  // Update crop origin/size in MAIN world (top edge → consume top content)
+  try {
+    const res = await chrome.scripting.executeScript({
+      target: { tabId: session.tabId },
+      world: "MAIN",
+      func: (dl, dt, dw, dh) => {
+        if (!window.__viewProxyAttractor?.applyBoundsDelta) return { ok: false };
+        return window.__viewProxyAttractor.applyBoundsDelta(dl, dt, dw, dh);
+      },
+      args: [dLeft, dTop, dWidth, dHeight]
+    });
+    const box = res?.[0]?.result?.box;
+    if (box) {
+      session.box = box;
+      await chrome.storage.session.set({ viewproxyFocusSession: session });
+    }
+  } catch (_) {}
+
+  // Re-fill so the (possibly new) box fills the client area
+  await applyAttractFill(session.tabId, session.box.width, session.box.height);
+}
 
 async function stopAll(tabId) {
   await stopWatchProxy();
@@ -364,7 +451,10 @@ async function startFocusMode({ tabId, pixelBox, viewport }) {
     originalHadOtherTabs: origTabCount > 1,
     focusWindowId: null,
     box,
-    viewport: vp
+    viewport: vp,
+    lastBounds: null,
+    cropResize: true,
+    ignoreBounds: true // ignore until initial sizing finishes
   };
   focusSession = session;
   await chrome.storage.session.set({ viewproxyFocusSession: session });
@@ -437,17 +527,15 @@ async function startFocusMode({ tabId, pixelBox, viewport }) {
 
   // 4) Rewrite window dimensions to the box (the attractor)
   if (win?.id) {
+    session.ignoreBounds = true;
     await chrome.windows.update(win.id, {
       width: Math.max(100, Math.round(box.width + chromeW)),
       height: Math.max(80, Math.round(box.height + chromeH))
     });
 
-    // 5) Fluid fill: scale stage so box W×H fills the REAL client area.
-    //    Measure from ISOLATED world (unpatched) — MAIN freezes innerWidth.
     await new Promise((r) => setTimeout(r, 80));
     await applyAttractFill(tabId, box.width, box.height);
 
-    // One more chrome correction + fill (title bar can shift after first resize)
     await new Promise((r) => setTimeout(r, 50));
     try {
       const m2 = await chrome.scripting.executeScript({
@@ -464,15 +552,7 @@ async function startFocusMode({ tabId, pixelBox, viewport }) {
       if (r2?.iw && r2?.ih) {
         const cW = Math.max(0, Math.min(48, (r2.ow || 0) - r2.iw));
         const cH = Math.max(24, Math.min(100, (r2.oh || 0) - r2.ih));
-        // If isolated still reports frozen size (same as layout), skip re-size
-        if (Math.abs(r2.iw - box.width) > 4 || Math.abs(r2.ih - box.height) > 4) {
-          // Real client differs from box — just fill to whatever client is
-          await applyAttractFill(tabId, box.width, box.height, r2.iw, r2.ih);
-        } else {
-          // Client matches box; ensure fill scale = 1 (or tiny chrome error)
-          await applyAttractFill(tabId, box.width, box.height, r2.iw, r2.ih);
-        }
-        // If client is way off box, re-assert outer size once
+        await applyAttractFill(tabId, box.width, box.height, r2.iw, r2.ih);
         if (Math.abs(r2.iw - box.width) > 8 || Math.abs(r2.ih - box.height) > 8) {
           await chrome.windows.update(win.id, {
             width: Math.max(100, Math.round(box.width + cW)),
@@ -483,13 +563,31 @@ async function startFocusMode({ tabId, pixelBox, viewport }) {
         }
       }
     } catch (_) {}
+
+    // Seed lastBounds AFTER programmatic sizing so user drags are relative to final box
+    try {
+      const finalWin = await chrome.windows.get(win.id);
+      session.lastBounds = {
+        left: finalWin.left,
+        top: finalWin.top,
+        width: finalWin.width,
+        height: finalWin.height
+      };
+    } catch (_) {
+      session.lastBounds = null;
+    }
+    session.ignoreBounds = false;
+    session.cropResize = true;
+    focusSession = session;
+    await chrome.storage.session.set({ viewproxyFocusSession: session });
   }
 
   return {
     mode: "attract",
     w: box.width,
     h: box.height,
-    windowId: session.focusWindowId
+    windowId: session.focusWindowId,
+    cropResize: true
   };
 }
 
